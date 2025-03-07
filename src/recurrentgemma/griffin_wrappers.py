@@ -107,10 +107,7 @@ class GriffinRecurrentBlock(nn.Module):
         input_size: int,
         hidden_size: int,
         num_layers: int = 1,
-        nonlinearity: str = "tanh",  # Not used, as RecurrentBlock specifics take precedence.
-        bias: bool = True,  # Bias is handled internally in the RecurrentBlock layers.
         batch_first: bool = False,
-        dropout: float = 0.0,  # Dropout handling to be ignored for this wrapper.
         bidirectional: bool = False,  # Not supported for RecurrentBlock.
         device: str | torch.device | None = None,
     ):
@@ -179,10 +176,8 @@ class GriffinRecurrentBlock(nn.Module):
         else:
             input_cache = RecurrentBlockCache(rg_lru_state=hx, conv1d_state=self.conv1d_state)
 
-        # Create default segment positions (all zeros).
-        segment_pos = torch.zeros(
-            (batch_size, seq_len), dtype=torch.long, device=input_bxtxd.device
-        )
+        # Create a segment_pos tensor where the second dimension counts up from 0 to (seq_len - 1).
+        segment_pos = torch.arange(seq_len, device=input_bxtxd.device).unsqueeze(0).expand(batch_size, -1)
 
         # Forward through the RecurrentBlock.
         output, output_cache = self.recurrent_block(input_bxtxd, segment_pos, input_cache, return_cache=True)
