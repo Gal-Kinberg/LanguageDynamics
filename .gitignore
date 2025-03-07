@@ -2,3 +2,5 @@
 .idea/
 
 Datasets/
+
+**/__pycache__/
