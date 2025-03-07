@@ -60,8 +60,10 @@ def train_FlipFlop():
 		n_outputs=n_bits, # d
 		rnn_type=rnn_type)
 
+	# learning_rate = 1./np.sqrt(batch_size)
+	learning_rate = 1./np.sqrt(batch_size)
 	losses, grad_norms = model.train(train_data, valid_data,
-		learning_rate=1./np.sqrt(batch_size),
+		learning_rate=learning_rate,
 		batch_size=batch_size)
 
 	valid_predictions = model.predict(valid_data)
@@ -99,7 +101,7 @@ def find_fixed_points(model, valid_predictions):
 		'verbose': True, 
 		'super_verbose': True}
 
-	# Setup the fixed point finder
+	# Set up the fixed point finder
 	fpf = FixedPointFinder(model.rnn, **fpf_hps)
 
 	'''Draw random, noise corrupted samples of those state trajectories
@@ -115,7 +117,7 @@ def find_fixed_points(model, valid_predictions):
 	unique_fps, all_fps = fpf.find_fixed_points(initial_states, inputs)
 
 	# Visualize identified fixed points with overlaid RNN state trajectories
-	# All visualized in the 3D PCA space fit the the example RNN states.
+	# All visualized in the 3D PCA space fit the example RNN states.
 	fig = plot_fps(unique_fps, valid_predictions['hidden'],
 		plot_batch_idx=list(range(30)),
 		plot_start_time=10)
