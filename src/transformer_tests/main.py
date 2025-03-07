@@ -67,7 +67,7 @@ if __name__ == '__main__':
     dataset_tokenized = dataset['test'].map(tokenize_dataset, batched=True, batch_size=batch_size)
     embedded_results = dataset_tokenized.map(process_dataset, batched=True, batch_size=batch_size)
 
-    embedded_results_loaded = datasets.load_from_disk(r'C:\Users\Gankl\PycharmProjects\LanguageDynamics\Datasets\rotten_tomatoes_test_tokens')
+    embedded_results_loaded = datasets.load_from_disk(r'/Datasets/rotten_tomatoes_test_tokens')
 
     n_examples = 10
     generated_tokens = torch.tensor(embedded_results[0:n_examples]['embedding'])
