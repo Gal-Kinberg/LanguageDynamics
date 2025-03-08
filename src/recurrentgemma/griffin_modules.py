@@ -631,13 +631,14 @@ class RecurrentBlock(nn.Module):
 
     # x branch.
     x = self.linear_x(x)
-    x, conv1d_state = self.conv_1d(
+    x, conv1d_state_bxdxh = self.conv_1d(
         x=x,
         segment_pos=segment_pos,
         cache=None if cache is None else cache.conv1d_state,
         return_cache=return_cache,
     )
-    x, rg_lru_state = self.rg_lru(
+    # maybe need to output the entire x here?
+    x, rg_lru_state_1xbxh = self.rg_lru(
         x=x,
         segment_pos=segment_pos,
         cache=None if cache is None else cache.rg_lru_state,
@@ -652,8 +653,8 @@ class RecurrentBlock(nn.Module):
       return x, None
 
     return x, RecurrentBlockCache(
-        conv1d_state=conv1d_state,
-        rg_lru_state=rg_lru_state,
+        conv1d_state=conv1d_state_bxdxh,
+        rg_lru_state=rg_lru_state_1xbxh,
     )
 
   @classmethod

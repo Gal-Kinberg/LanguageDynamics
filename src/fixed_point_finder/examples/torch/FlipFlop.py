@@ -82,7 +82,10 @@ class FlipFlop(nn.Module):
 
 		zeros_1xd = torch.zeros(1, n_hidden, device=self.device)
 
-		self.initial_hiddens_1xd = nn.Parameter(zeros_1xd)
+		if self.rnn_type=='griffin-recurrent-block':
+			self.initial_hiddens_1xd = nn.Parameter(torch.zeros(1, n_hidden * 4, device=self.device)) # 4 comes from conv1d_width
+		else:
+			self.initial_hiddens_1xd = nn.Parameter(zeros_1xd)
 
 		self._is_lstm = False
 
@@ -149,7 +152,7 @@ class FlipFlop(nn.Module):
 		# Expand initial hidden state to match batch size. This creates a new
 		# view without actually creating a new copy of it in memory.
 		initial_hiddens_1xbxd = self.initial_hiddens_1xd.expand(
-			1, batch_size, self.n_hidden)
+			1, batch_size, self.n_hidden * (1 + (3 * (self.rnn_type == 'griffin-recurrent-block'))))
 
 		if self._is_lstm:
 			initial_cell_1xbxd = self.initial_cell_1xd.expand(
@@ -158,17 +161,18 @@ class FlipFlop(nn.Module):
 			initial_lstm_state = (initial_hiddens_1xbxd, initial_cell_1xbxd)
 
 			# Pass the input through the RNN layer
-			hiddens_bxtxd, _ = self.rnn(inputs_bxtxd, initial_lstm_state)
+			hiddens_bxtxh, _ = self.rnn(inputs_bxtxd, initial_lstm_state)
 
 		else:
 			# Pass the input through the RNN layer
-			hiddens_bxtxd, _ = self.rnn(inputs_bxtxd, initial_hiddens_1xbxd)  # returns hidden states for each timestep
+			hiddens_bxtxh, hn = self.rnn(inputs_bxtxd, initial_hiddens_1xbxd)  # returns hidden states for each timestep
 
-		outputs_bxtxd = self.readout(hiddens_bxtxd)
+		outputs_bxtxd = self.readout(hiddens_bxtxh)
 
 		return {
 			'output': outputs_bxtxd,
-			'hidden': hiddens_bxtxd,
+			'hidden': hiddens_bxtxh,
+			'cache': hn,
 			}
 
 	def predict(self, data):
@@ -217,7 +221,8 @@ class FlipFlop(nn.Module):
 		min_loss=1e-4,
 		disp_every=1,
 		plot_every=5,
-		max_norm=1.):
+		max_norm=1.,
+		max_epochs=400):
 
 		train_dataset = FlipFlopDataset(train_data, device=self.device)
 		valid_dataset = FlipFlopDataset(valid_data, device=self.device)
@@ -244,7 +249,7 @@ class FlipFlop(nn.Module):
 		grad_norms = []
 		fig = None
 
-		while True:
+		while epoch <= max_epochs:
 
 			t_start = time.time()
 

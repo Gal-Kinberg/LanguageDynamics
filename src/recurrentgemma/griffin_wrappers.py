@@ -153,13 +153,13 @@ class GriffinRecurrentBlock(nn.Module):
 
         Args:
             input_bxtxd: Tensor of shape (seq, batch, input_size) if batch_first=False,
-                   else (batch, seq, input_size).
-            hx: Optional initial hidden state, defaults to zeros if not provided.
+                   else (batch, seq, input_size). shape: bxtxd
+            hx: Optional initial hidden state, defaults to zeros if not provided. shape: 1xbxh
 
         Returns:
             output: Tensor of shape (seq, batch, hidden_size) if batch_first=False,
-                    else (batch, seq, hidden_size).
-            hn: Last hidden state of shape (batch, hidden_size).
+                    else (batch, seq, hidden_size). shape: bxtxh
+            hn: Last hidden state of shape (batch, hidden_size). shape: 1xbxh
         """
         if not self.batch_first:
             # Adjust input for batch-first mode.
@@ -174,14 +174,19 @@ class GriffinRecurrentBlock(nn.Module):
             # )
             input_cache = RecurrentBlock.init_cache(batch_size=batch_size, lru_width=self.hidden_size, device=self.device, dtype=input_bxtxd.dtype)
         else:
-            input_cache = RecurrentBlockCache(rg_lru_state=hx, conv1d_state=self.conv1d_state)
+            rg_lru_cache = hx[:, :, :self.hidden_size]
+            conv1d_cache = hx[:, :, self.hidden_size:]
+            conv1d_cache = conv1d_cache.reshape(batch_size, self.input_size, self.hidden_size)
+            input_cache = RecurrentBlockCache(rg_lru_state=rg_lru_cache, conv1d_state=conv1d_cache if seq_len == 1 else None)
 
         # Create a segment_pos tensor where the second dimension counts up from 0 to (seq_len - 1).
         segment_pos = torch.arange(seq_len, device=input_bxtxd.device).unsqueeze(0).expand(batch_size, -1)
 
         # Forward through the RecurrentBlock.
         output, output_cache = self.recurrent_block(input_bxtxd, segment_pos, input_cache, return_cache=True)
-        hn = output_cache.rg_lru_state
+        conv1d_cache_out = output_cache.conv1d_state.reshape(1, batch_size, -1)
+        hn = torch.cat([output_cache.rg_lru_state, conv1d_cache_out], dim=2)
+        # hn = output_cache.rg_lru_state
         # self.conv1d_state = output_cache.conv1d_state
 
         if not self.batch_first:
