@@ -95,10 +95,10 @@ def find_fixed_points(model, valid_predictions):
 	'''Fixed point finder hyperparameters. See FixedPointFinder.py for detailed
 	descriptions of available hyperparameters.'''
 	fpf_hps = {
-		'max_iters': 10000,
+		'max_iters': 1000,
 		'lr_init': 1.,
 		'outlier_distance_scale': 10.0,
-		'verbose': True, 
+		'verbose': True,
 		'super_verbose': True}
 
 	# Set up the fixed point finder
@@ -106,9 +106,10 @@ def find_fixed_points(model, valid_predictions):
 
 	'''Draw random, noise corrupted samples of those state trajectories
 	to use as initial states for the fixed point optimizations.'''
-	initial_states = fpf.sample_states(valid_predictions['hidden'],
-		n_inits=N_INITS,
-		noise_scale=NOISE_SCALE)
+	valid_initial_states = valid_predictions['cache'] if model.rnn_type == 'griffin-recurrent-block' else valid_predictions['hidden']
+	initial_states = fpf.sample_states(valid_initial_states,
+									   n_inits=N_INITS,
+									   noise_scale=NOISE_SCALE)
 
 	# Study the system in the absence of input pulses (e.g., all inputs are 0)
 	inputs = np.zeros([1, n_bits])
@@ -118,9 +119,9 @@ def find_fixed_points(model, valid_predictions):
 
 	# Visualize identified fixed points with overlaid RNN state trajectories
 	# All visualized in the 3D PCA space fit the example RNN states.
-	fig = plot_fps(unique_fps, valid_predictions['hidden'],
-		plot_batch_idx=list(range(30)),
-		plot_start_time=10)
+	fig = plot_fps(unique_fps, valid_initial_states,
+				   plot_batch_idx=list(range(30)),
+				   plot_start_time=10)
 
 def main():
 
