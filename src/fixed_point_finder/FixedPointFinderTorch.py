@@ -102,15 +102,15 @@ class FixedPointFinderTorch(FixedPointFinderBase):
         inputs_bx1xd = inputs_bx1xd.to(self.device)
 
         # Unsqueeze to promote appropriate broadcasting
-        x_1xbxd = torch.from_numpy(initial_states).unsqueeze(0)
-        x_1xbxd = x_1xbxd.to(self.torch_dtype)
-        x_1xbxd = x_1xbxd.to(self.device)
+        x_1xbxh = torch.from_numpy(initial_states).unsqueeze(0)
+        x_1xbxh = x_1xbxh.to(self.torch_dtype)
+        x_1xbxh = x_1xbxh.to(self.device)
 
         inputs_bx1xd.requires_grad = False
-        x_1xbxd.requires_grad = True
+        x_1xbxh.requires_grad = True
 
         init_lr = 0.05
-        optimizer = torch.optim.Adam([x_1xbxd], lr=self.lr_init)
+        optimizer = torch.optim.Adam([x_1xbxh], lr=self.lr_init)
 
         # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 
         #     step_size=500, 
@@ -134,9 +134,9 @@ class FixedPointFinderTorch(FixedPointFinderBase):
 
         while True:
             
-            F_x_bx1xd, F_x_1xbxd = self.rnn(inputs_bx1xd, x_1xbxd)
+            F_x_bx1xh, F_x_1xbxh = self.rnn(inputs_bx1xd, x_1xbxh)
 
-            dx_bxd = torch.squeeze(x_1xbxd - F_x_1xbxd)
+            dx_bxd = torch.squeeze(x_1xbxh - F_x_1xbxh)
             q_b = 0.5 * torch.sum(torch.square(dx_bxd), axis=1)
             q_scalar = torch.mean(q_b)
             dq_b = torch.abs(q_b - q_prev_b)
@@ -184,10 +184,10 @@ class FixedPointFinderTorch(FixedPointFinderBase):
                 is_final=True)
 
         # remove extra dims
-        xstar = x_1xbxd.squeeze(0)
+        xstar = x_1xbxh.squeeze(0)
         xstar = xstar.detach().cpu().numpy()
         
-        F_xstar = F_x_1xbxd.squeeze(0)
+        F_xstar = F_x_1xbxh.squeeze(0)
         F_xstar = F_xstar.detach().cpu().numpy()
 
         # Indicate same n_iters for each initialization (i.e., joint optimization)        
