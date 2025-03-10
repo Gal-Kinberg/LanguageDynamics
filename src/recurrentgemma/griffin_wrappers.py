@@ -1,8 +1,8 @@
 import torch
 from torch import nn
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 from recurrentgemma.griffin_layers import RGLRU
-from recurrentgemma.griffin_modules import RecurrentBlock, ResidualBlock, RecurrentBlockCache
+from recurrentgemma.griffin_modules import RecurrentBlock, ResidualBlock, RecurrentBlockCache, ModifiedRecurrentBlock
 
 
 class RGLRUWrapper(nn.Module):
@@ -138,7 +138,7 @@ class GriffinRecurrentBlock(nn.Module):
         self.conv1d_state = None
 
         # Initialize the RecurrentBlock module.
-        self.recurrent_block = RecurrentBlock(
+        self.recurrent_block = ModifiedRecurrentBlock(
             width=self.input_size,
             lru_width=self.hidden_size,
             num_heads=1,  # Defaulting to a single head; can be parameterized.
@@ -147,7 +147,7 @@ class GriffinRecurrentBlock(nn.Module):
 
     def forward(
         self, input_bxtxd: torch.Tensor, hx: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[tuple[Any, Any], Any]:
         """
         Forward pass through the RecurrentBlock.
 
@@ -174,26 +174,27 @@ class GriffinRecurrentBlock(nn.Module):
             # )
             input_cache = RecurrentBlock.init_cache(batch_size=batch_size, lru_width=self.hidden_size, device=self.device, dtype=input_bxtxd.dtype)
         else:
-            rg_lru_cache = hx[:, :, :self.hidden_size]
-            conv1d_cache = hx[:, :, self.hidden_size:]
-            conv1d_cache = conv1d_cache.reshape(batch_size, self.input_size, self.hidden_size)
-            input_cache = RecurrentBlockCache(rg_lru_state=rg_lru_cache, conv1d_state=conv1d_cache if seq_len == 1 else None)
+            # rg_lru_cache = hx[:, :, :self.hidden_size]
+            # conv1d_cache = hx[:, :, self.hidden_size:]
+            # conv1d_cache = conv1d_cache.reshape(batch_size, self.input_size, self.hidden_size)
+            # input_cache = RecurrentBlockCache(rg_lru_state=rg_lru_cache, conv1d_state=conv1d_cache if seq_len == 1 else None)
+            input_cache = RecurrentBlockCache(rg_lru_state=hx, conv1d_state=None)
 
         # Create a segment_pos tensor where the second dimension counts up from 0 to (seq_len - 1).
         segment_pos = torch.arange(seq_len, device=input_bxtxd.device).unsqueeze(0).expand(batch_size, -1)
 
         # Forward through the RecurrentBlock.
-        output, output_cache = self.recurrent_block(input_bxtxd, segment_pos, input_cache, return_cache=True)
-        conv1d_cache_out = output_cache.conv1d_state.reshape(1, batch_size, -1)
-        hn = torch.cat([output_cache.rg_lru_state, conv1d_cache_out], dim=2)
-        # hn = output_cache.rg_lru_state
+        output, rg_lru_state_traj_bxtxh, output_cache = self.recurrent_block(input_bxtxd, segment_pos, input_cache, return_cache=True)
+        # conv1d_cache_out = output_cache.conv1d_state.reshape(1, batch_size, -1)
+        # hn = torch.cat([output_cache.rg_lru_state, conv1d_cache_out], dim=2)
+        hn = output_cache.rg_lru_state
         # self.conv1d_state = output_cache.conv1d_state
 
         if not self.batch_first:
             # Adjust output back to batch-first mode.
             output = output.transpose(0, 1)
 
-        return output, hn
+        return (output, rg_lru_state_traj_bxtxh), hn
 
 
 class GriffinResidualBlock(nn.Module):

@@ -106,6 +106,7 @@ def find_fixed_points(model, valid_predictions):
 
 	'''Draw random, noise corrupted samples of those state trajectories
 	to use as initial states for the fixed point optimizations.'''
+	# valid_initial_states should be example trajectories of shape bxtxh (h is the full hidden state)
 	valid_initial_states = valid_predictions['cache'] if model.rnn_type == 'griffin-recurrent-block' else valid_predictions['hidden']
 	initial_states = fpf.sample_states(valid_initial_states,
 									   n_inits=N_INITS,

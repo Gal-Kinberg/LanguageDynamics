@@ -80,12 +80,9 @@ class FlipFlop(nn.Module):
 		self.rnn_type = rnn_type.lower()
 		self.device = self._get_device()
 
-		zeros_1xd = torch.zeros(1, n_hidden, device=self.device)
+		zeros_1xh = torch.zeros(1, n_hidden, device=self.device)
 
-		if self.rnn_type=='griffin-recurrent-block':
-			self.initial_hiddens_1xd = nn.Parameter(torch.zeros(1, n_hidden * 4, device=self.device)) # 4 comes from conv1d_width
-		else:
-			self.initial_hiddens_1xd = nn.Parameter(zeros_1xd)
+		self.initial_hiddens_1xh = nn.Parameter(zeros_1xh)
 
 		self._is_lstm = False
 
@@ -105,7 +102,7 @@ class FlipFlop(nn.Module):
 		elif self.rnn_type=='lstm':
 
 			self._is_lstm = True
-			self.initial_cell_1xd = nn.Parameter(zeros_1xd)
+			self.initial_cell_1xd = nn.Parameter(zeros_1xh)
 			self.rnn = nn.LSTM(n_inputs, n_hidden,
 				batch_first=True,
 				device=self.device)
@@ -151,28 +148,37 @@ class FlipFlop(nn.Module):
 
 		# Expand initial hidden state to match batch size. This creates a new
 		# view without actually creating a new copy of it in memory.
-		initial_hiddens_1xbxd = self.initial_hiddens_1xd.expand(
-			1, batch_size, self.n_hidden * (1 + (3 * (self.rnn_type == 'griffin-recurrent-block'))))
+		initial_hiddens_1xbxh = self.initial_hiddens_1xh.expand(
+			1, batch_size, self.n_hidden)
 
 		if self._is_lstm:
 			initial_cell_1xbxd = self.initial_cell_1xd.expand(
 				1, batch_size, self.n_hidden)
 
-			initial_lstm_state = (initial_hiddens_1xbxd, initial_cell_1xbxd)
+			initial_lstm_state = (initial_hiddens_1xbxh, initial_cell_1xbxd)
 
 			# Pass the input through the RNN layer
 			hiddens_bxtxh, _ = self.rnn(inputs_bxtxd, initial_lstm_state)
 
+		elif self.rnn_type == 'griffin-recurrent-block':
+			# Pass the input through the RNN layer
+			(hiddens_bxtxh, rg_lru_state_traj_bxtxh), hn = self.rnn(inputs_bxtxd, initial_hiddens_1xbxh)  # returns hidden states for each timestep
 		else:
 			# Pass the input through the RNN layer
-			hiddens_bxtxh, hn = self.rnn(inputs_bxtxd, initial_hiddens_1xbxd)  # returns hidden states for each timestep
+			hiddens_bxtxh, hn = self.rnn(inputs_bxtxd, initial_hiddens_1xbxh)  # returns hidden states for each timestep
 
 		outputs_bxtxd = self.readout(hiddens_bxtxh)
 
-		return {
-			'output': outputs_bxtxd,
-			'hidden': hiddens_bxtxh,
-			'cache': hn,
+		if self.rnn_type == 'griffin-recurrent-block':
+			return {
+				'output': outputs_bxtxd,
+				'hidden': hiddens_bxtxh,
+				'cache': rg_lru_state_traj_bxtxh,
+				}
+		else:
+			return {
+				'output': outputs_bxtxd,
+				'hidden': hiddens_bxtxh,
 			}
 
 	def predict(self, data):

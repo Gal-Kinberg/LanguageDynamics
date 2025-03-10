@@ -15,7 +15,7 @@
 """Griffin and Hawk"s model components."""
 
 import math
-from typing import Literal, NamedTuple, overload
+from typing import Literal, NamedTuple, overload, Any
 
 import einops
 from recurrentgemma import griffin_common as common
@@ -24,8 +24,7 @@ from recurrentgemma import array_typing as at
 # from recurrentgemma.torch import layers
 from recurrentgemma import griffin_layers as layers
 import torch
-from torch import nn
-
+from torch import nn, Tensor
 
 _MIN_LOGITS_VALUE = -2.3819763e38  # Set to a large negative number.
 _MAX_WAVELENGTH = 10_000
@@ -653,6 +652,195 @@ class RecurrentBlock(nn.Module):
       return x, None
 
     return x, RecurrentBlockCache(
+        conv1d_state=conv1d_state_bxdxh,
+        rg_lru_state=rg_lru_state_1xbxh,
+    )
+
+  @classmethod
+  def init_cache(
+      cls,
+      batch_size: int,
+      lru_width: int,
+      dtype: torch.dtype,
+      conv1d_temporal_width: int = 4,
+      device: str | torch.device | None = None,
+  ) -> RecurrentBlockCache:
+    """Initializes an empty RG-LRU and Conv1D cache for the block."""
+    return RecurrentBlockCache(
+        rg_lru_state=layers.RGLRU.init_cache(
+            batch_size=batch_size,
+            width=lru_width,
+            device=device,
+        ),
+        conv1d_state=layers.Conv1D.init_cache(
+            batch_size=batch_size,
+            width=lru_width,
+            dtype=dtype,
+            conv1d_temporal_width=conv1d_temporal_width,
+            device=device,
+        ),
+    )
+
+class ModifiedRecurrentBlock(nn.Module):
+  """Griffin and Hawk's recurrent block."""
+
+  def __init__(
+      self,
+      width: int,  # input_dim, d
+      num_heads: int,
+      lru_width: int | None = None,  # hidden_size, h
+      conv1d_temporal_width: int = 4,
+      final_w_init_variance_scale: float = 1.0,
+      device: str | torch.device | None = None,
+      dtype: torch.dtype | None = None,
+  ):
+    """Initializes the recurrent block.
+
+    Args:
+      width: The width of the block.
+      num_heads: The number of RG-LRU heads/blocks to use.
+      lru_width: Internal dimension to be projected into for RG-LRU to operate
+        on.
+      conv1d_temporal_width: The temporal width of the 1d convolution.
+      final_w_init_variance_scale: The scale for the initialization of the last
+        layer of the block.
+      device: On what device to initialize parameters. Needed to allow for
+        initializing the module without parameter initialization.
+      dtype: What dtype to use for initialziation.
+    """
+    super().__init__()
+    self.width = width
+    self.num_heads = num_heads
+    self.lru_width = lru_width or width
+    self.conv1d_temporal_width = conv1d_temporal_width
+    self.final_w_init_variance_scale = final_w_init_variance_scale
+
+    # Layers.
+    self.linear_y = nn.Linear(
+        in_features=self.width,
+        out_features=self.lru_width,
+        device=device,
+        dtype=dtype,
+    )
+    self.linear_x = nn.Linear(
+        in_features=self.width,
+        out_features=self.lru_width,
+        device=device,
+        dtype=dtype,
+    )
+    # self.linear_out = nn.Linear(
+    #     in_features=self.lru_width,
+    #     out_features=self.width,
+    #     device=device,
+    #     dtype=dtype,
+    # )
+    self.conv_1d = layers.Conv1D(
+        width=self.lru_width,
+        temporal_width=self.conv1d_temporal_width,
+        device=device,
+        dtype=dtype,
+    )
+    self.rg_lru = layers.RGLRU(
+        width=self.lru_width,
+        num_heads=self.num_heads,
+        device=device,
+        dtype=dtype,
+    )
+
+    # Initialization.
+    self.reset_parameters()
+
+  def reset_parameters(self) -> None:
+    """Resets the parameters of the module."""
+    self.w_init_(self.linear_x.weight)
+    torch.nn.init.zeros_(self.linear_x.bias)
+    self.w_init_(self.linear_y.weight)
+    torch.nn.init.zeros_(self.linear_y.bias)
+    # self.out_w_init_(self.linear_out.weight)
+    # torch.nn.init.zeros_(self.linear_out.bias)
+    self.conv_1d.reset_parameters()
+    self.rg_lru.reset_parameters()
+
+  def w_init_(self, w: torch.Tensor) -> None:
+    """Initializes the weights of the linear x and y layers of the block."""
+    torch.nn.init.normal_(w, mean=0.0, std=math.sqrt(1.0 / self.width))
+
+  def out_w_init_(self, w: torch.Tensor) -> None:
+    """Initializes the weights of the last layer of the block."""
+    std = math.sqrt(self.final_w_init_variance_scale / self.lru_width)
+    torch.nn.init.normal_(w, mean=0.0, std=std)
+
+  @overload
+  def forward(
+      self,
+      x: at.Activations,
+      segment_pos: at.SegmentPos,
+      cache: RecurrentBlockCache | None = None,
+      return_cache: Literal[True] = True,
+  ) -> tuple[at.Activations, RecurrentBlockCache]:
+    ...
+
+  @overload
+  def forward(
+      self,
+      x: at.Activations,
+      segment_pos: at.SegmentPos,
+      cache: RecurrentBlockCache | None = None,
+      return_cache: Literal[False] = False,
+  ) -> tuple[at.Activations, None]:
+    ...
+
+  @at.typed
+  def forward(
+      self,
+      x: at.Activations,
+      segment_pos: at.SegmentPos,
+      cache: RecurrentBlockCache | None = None,
+      return_cache: bool = True,
+  ) -> tuple[Tensor | Any, None] | tuple[Tensor | Any, Any, RecurrentBlockCache]:
+    """Calls the recurrent block.
+
+    Args:
+      x: Sequence of input activations.
+      segment_pos: Position of each token in the sequence.
+      cache: Optional cache with the previous state of the RG-LRU and Conv1D.
+      return_cache: Whether to compute and return the updated cache.
+
+    Returns:
+      Output of the block together with the updated cache. If `cache` is None
+      than the returned updated cache is empty initialized and filled in from
+      the input sequence.
+    """
+    # y branch.
+    y = self.linear_y(x)
+    y = gelu(y)
+
+    # x branch.
+    x = self.linear_x(x)
+    x, conv1d_state_bxdxh = self.conv_1d(
+        x=x,
+        segment_pos=segment_pos,
+        cache=None if cache is None else cache.conv1d_state,
+        return_cache=return_cache,
+    )
+    conv1d_state_traj_bxtxh = x
+    # maybe need to output the entire x here?
+    x, rg_lru_state_1xbxh = self.rg_lru(
+        x=x,
+        segment_pos=segment_pos,
+        cache=None if cache is None else cache.rg_lru_state,
+        return_cache=return_cache,
+    )
+    rg_lru_state_traj_bxtxh = x
+
+    # Join branches.
+    x = x * y
+    # x = self.linear_out(x)
+
+    if not return_cache:
+      return x, None
+
+    return x, rg_lru_state_traj_bxtxh, RecurrentBlockCache(
         conv1d_state=conv1d_state_bxdxh,
         rg_lru_state=rg_lru_state_1xbxh,
     )
