@@ -147,13 +147,14 @@ def find_fixed_points(model, valid_predictions):
                    plot_batch_idx=list(range(30)),
                    plot_start_time=10)
 
+    return unique_fps
 
-def create_constant_flipflop_data(desired_inputs: np.ndarray):
+
+def create_constant_flipflop_data(desired_inputs: np.ndarray, n_time = 300, active_fraction=0.5):
     '''Creates FlipFlopData object and generates constant data.'''
     n_bits = desired_inputs.shape[1]
-    n_time = 300
     data_gen = FlipFlopData(n_bits=n_bits, n_time=n_time)
-    constant_data = data_gen.generate_constant_data(desired_inputs)
+    constant_data = data_gen.generate_constant_data(desired_inputs, active_fraction=active_fraction)
     return constant_data
 
 
@@ -181,14 +182,16 @@ if __name__ == '__main__':
 
     # STEP 2: Find, analyze, and visualize the fixed points of the trained RNN
     if do_find_fixed_points:
-        find_fixed_points(model, valid_predictions)
+        unique_fps = find_fixed_points(model, valid_predictions)
 
     # test constant data
-    desired_inputs = np.array([[1, 1], [-1, -1], [1, -1], [-1, 1]])
-    constant_data = create_constant_flipflop_data(desired_inputs)
+    n_time = 1000
+    active_fraction = 0.1
+    desired_inputs = np.array([[0, 0], [-1, -1], [1, -1], [-1, 1]])
+    constant_data = create_constant_flipflop_data(desired_inputs, n_time=n_time, active_fraction=active_fraction)
     constant_predictions = model.predict(constant_data)
 
-    variable_to_plot = 'output'
+    variable_to_plot = 'hidden'
     plot_neurons(constant_predictions[f'{variable_to_plot}'][0], f'{variable_to_plot}')
 
     print('Entering debug mode to allow interaction with objects and figures.')

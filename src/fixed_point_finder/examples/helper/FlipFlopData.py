@@ -105,20 +105,23 @@ class FlipFlopData(object):
             'targets': targets.astype(np.float32)
         }
 
-    def generate_constant_data(self, desired_inputs, dtype=np.float32):
+    def generate_constant_data(self, desired_inputs, dtype=np.float32, active_fraction=0.5):
         """
-        Generate trial data where input pulses are constant for the first half
-        of the time and zero for the second half.
+        Generate trial data where input pulses are constant for active_fraction
+        of the time and zero for the rest.
 
         Args:
             desired_inputs: A numpy array of shape [n_trials, self.n_bits], where
                             n_trials is the number of trials.
             dtype: Numpy datatype for the generated data. Default: np.float32.
+            active_fraction: Float in [0, 1]. Fraction of time steps where inputs
+                            are constant. The rest are zero. Default: 0.5.
 
         Returns:
             dict: A dictionary containing:
                 'inputs': A numpy array of shape [n_trials, self.n_time, self.n_bits]
-                          with constant inputs for the first half and zero for the second half.
+                          with constant inputs for active_fraction and zero
+                          for the rest.
                 'targets': A numpy array of shape [n_trials, self.n_time, self.n_bits]
                            (matches 'inputs').
         """
@@ -131,11 +134,15 @@ class FlipFlopData(object):
             )
             raise ValueError(error_message)
 
+        # Validation check for active_fraction
+        if not (0 <= active_fraction <= 1):
+            raise ValueError(f"active_fraction must be in [0, 1], but got {active_fraction}.")
+
         # Create repeated inputs
         n_trials = desired_inputs.shape[0]
-        half_time = self.n_time // 2
+        active_time = int(self.n_time * active_fraction)
         repeated_inputs = np.zeros([n_trials, self.n_time, self.n_bits], dtype=dtype)
-        repeated_inputs[:, :half_time, :] = self._create_repeated_inputs(desired_inputs)[:, :half_time, :]
+        repeated_inputs[:, :active_time, :] = self._create_repeated_inputs(desired_inputs)[:, :active_time, :]
 
         # Targets are identical to inputs
         constant_targets = np.array(repeated_inputs, copy=True)
