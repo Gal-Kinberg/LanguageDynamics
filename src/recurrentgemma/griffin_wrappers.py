@@ -181,7 +181,10 @@ class GriffinRecurrentBlock(nn.Module):
             input_cache = RecurrentBlockCache(rg_lru_state=hx, conv1d_state=None)
 
         # Create a segment_pos tensor where the second dimension counts up from 0 to (seq_len - 1).
-        segment_pos = torch.arange(seq_len, device=input_bxtxd.device).unsqueeze(0).expand(batch_size, -1)
+        if seq_len == 1:
+            segment_pos = torch.ones((batch_size, 1), device=input_bxtxd.device)
+        else:
+            segment_pos = torch.arange(seq_len, device=input_bxtxd.device).unsqueeze(0).expand(batch_size, -1)
 
         # Forward through the RecurrentBlock.
         output, rg_lru_state_traj_bxtxh, output_cache = self.recurrent_block(input_bxtxd, segment_pos, input_cache, return_cache=True)
