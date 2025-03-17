@@ -144,8 +144,15 @@ class FlipFlopData(object):
         repeated_inputs = np.zeros([n_trials, self.n_time, self.n_bits], dtype=dtype)
         repeated_inputs[:, :active_time, :] = self._create_repeated_inputs(desired_inputs)[:, :active_time, :]
 
-        # Targets are identical to inputs
-        constant_targets = np.array(repeated_inputs, copy=True)
+        # Targets remember the sign of the last input
+        constant_targets = np.zeros_like(repeated_inputs)
+        for trial_idx in range(n_trials):
+            for bit_idx in range(self.n_bits):
+                last_sign = 0
+                for t in range(self.n_time):
+                    if repeated_inputs[trial_idx, t, bit_idx] != 0:
+                        last_sign = repeated_inputs[trial_idx, t, bit_idx]
+                    constant_targets[trial_idx, t, bit_idx] = last_sign
 
         return {
             'inputs': repeated_inputs,
