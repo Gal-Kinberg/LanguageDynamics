@@ -21,358 +21,361 @@ sys.path.insert(0, PATH_TO_FIXED_POINT_FINDER)
 
 from FlipFlopData import FlipFlopData
 
+
 class FlipFlopDataset(Dataset):
 
-	def __init__(self, data, device='cpu'):
-		'''
-		Args:
-			data:
-				Numpy data dict as returned by FlipFlopData.generate_data()
+    def __init__(self, data, device='cpu'):
+        '''
+        Args:
+            data:
+                Numpy data dict as returned by FlipFlopData.generate_data()
 
-		Returns:
-			None.
-		'''
+        Returns:
+            None.
+        '''
 
-		super().__init__()
-		self.device = device
-		self.data = data
+        super().__init__()
+        self.device = device
+        self.data = data
 
-	def __len__(self):
-		''' Returns the total number of trials contained in the dataset.
-		'''
-		return self.data['inputs'].shape[0]
+    def __len__(self):
+        ''' Returns the total number of trials contained in the dataset.
+        '''
+        return self.data['inputs'].shape[0]
 
-	def __getitem__(self, idx):
-		'''
-		Args:
-			idx: slice indices for indexing into the batch dimension of data
-			tensors.
+    def __getitem__(self, idx):
+        '''
+        Args:
+            idx: slice indices for indexing into the batch dimension of data
+            tensors.
 
-		Returns:
-			Dict of indexed torch.tensor objects, with key/value pairs
-			corresponding to those in self.data.
+        Returns:
+            Dict of indexed torch.tensor objects, with key/value pairs
+            corresponding to those in self.data.
 
-		'''
+        '''
 
-		inputs_bxtxd = torch.tensor(
-			self.data['inputs'][idx],
-			device=self.device)
+        inputs_bxtxd = torch.tensor(
+            self.data['inputs'][idx],
+            device=self.device)
 
-		targets_bxtxd = torch.tensor(
-			self.data['targets'][idx],
-			device=self.device)
+        targets_bxtxd = torch.tensor(
+            self.data['targets'][idx],
+            device=self.device)
 
-		return {
-			'inputs': inputs_bxtxd,
-			'targets': targets_bxtxd
-			}
+        return {
+            'inputs': inputs_bxtxd,
+            'targets': targets_bxtxd
+        }
+
 
 class FlipFlop(nn.Module):
 
-	def __init__(self, n_inputs, n_hidden, n_outputs,
-		rnn_type='tanh'):
+    def __init__(self, n_inputs, n_hidden, n_outputs,
+                 rnn_type='tanh'):
 
-		super().__init__()
+        super().__init__()
 
-		self.n_inputs = n_inputs  # d
-		self.n_hidden = n_hidden  # h
-		self.n_outputs = n_outputs  # d
-		self.rnn_type = rnn_type.lower()
-		self.device = self._get_device()
+        self.n_inputs = n_inputs  # d
+        self.n_hidden = n_hidden  # h
+        self.n_outputs = n_outputs  # d
+        self.rnn_type = rnn_type.lower()
+        self.device = self._get_device()
 
-		zeros_1xh = torch.zeros(1, n_hidden, device=self.device)
+        zeros_1xh = torch.zeros(1, n_hidden, device=self.device)
 
-		self.initial_hiddens_1xh = nn.Parameter(zeros_1xh)
+        self.initial_hiddens_1xh = nn.Parameter(zeros_1xh)
 
-		self._is_lstm = False
+        self._is_lstm = False
 
-		if self.rnn_type in ['tanh', 'relu']:
+        if self.rnn_type in ['tanh', 'relu']:
 
-			self.rnn = nn.RNN(n_inputs, n_hidden,
-				nonlinearity=self.rnn_type,
-				batch_first=True,
-				device=self.device)
+            self.rnn = nn.RNN(n_inputs, n_hidden,
+                              nonlinearity=self.rnn_type,
+                              batch_first=True,
+                              device=self.device)
 
-		elif self.rnn_type=='gru':
+        elif self.rnn_type == 'gru':
 
-			self.rnn = nn.GRU(n_inputs, n_hidden,
-				batch_first=True,
-				device=self.device)
+            self.rnn = nn.GRU(n_inputs, n_hidden,
+                              batch_first=True,
+                              device=self.device)
 
-		elif self.rnn_type=='lstm':
+        elif self.rnn_type == 'lstm':
 
-			self._is_lstm = True
-			self.initial_cell_1xd = nn.Parameter(zeros_1xh)
-			self.rnn = nn.LSTM(n_inputs, n_hidden,
-				batch_first=True,
-				device=self.device)
+            self._is_lstm = True
+            self.initial_cell_1xd = nn.Parameter(zeros_1xh)
+            self.rnn = nn.LSTM(n_inputs, n_hidden,
+                               batch_first=True,
+                               device=self.device)
 
-		elif self.rnn_type=='rg-lru':
-			self.rnn = RGLRUWrapper(n_inputs, n_hidden,  # (d, h)
-				batch_first=True,
-			)
+        elif self.rnn_type == 'rg-lru':
+            self.rnn = RGLRUWrapper(n_inputs, n_hidden,  # (d, h)
+                                    batch_first=True,
+                                    )
 
-		elif self.rnn_type=='griffin-recurrent-block':
-			self.rnn = GriffinRecurrentBlock(n_inputs, n_hidden,
-											 batch_first=True,
-											 device=self.device
-			)
+        elif self.rnn_type == 'griffin-recurrent-block':
+            self.rnn = GriffinRecurrentBlock(n_inputs, n_hidden,
+                                             batch_first=True,
+                                             device=self.device
+                                             )
 
 
-		else:
-			raise ValueError('Unsupported rnn_type: \'%s\'' % rnn_type)
+        else:
+            raise ValueError('Unsupported rnn_type: \'%s\'' % rnn_type)
 
-		self.readout = nn.Linear(n_hidden, n_outputs, device=self.device)
+        self.readout = nn.Linear(n_hidden, n_outputs, device=self.device)
 
-		# Create the loss function
-		self._loss_fn = nn.MSELoss()
+        # Create the loss function
+        self._loss_fn = nn.MSELoss()
 
-	def forward(self, data):
-		'''
-		Args:
-			data: dict of torch.tensor as returned by
-			FlipFlopDataset.__getitem__()
+    def forward(self, data):
+        '''
+        Args:
+            data: dict of torch.tensor as returned by
+            FlipFlopDataset.__getitem__()
 
-		Returns:
-			dict containing the following key/value pairs:
+        Returns:
+            dict containing the following key/value pairs:
 
-				'output': shape (n_batch, n_time, n_bits) torch.tensor
-				containing the outputs of the FlipFlop.
+                'output': shape (n_batch, n_time, n_bits) torch.tensor
+                containing the outputs of the FlipFlop.
 
-				'hidden': shape (n_batch, n_time, n_hidden) torch.tensor
-				containing the hidden unit activitys of the FlipFlop RNN.
-		'''
+                'hidden': shape (n_batch, n_time, n_hidden) torch.tensor
+                containing the hidden unit activitys of the FlipFlop RNN.
+        '''
 
-		inputs_bxtxd = data['inputs']
-		batch_size = inputs_bxtxd.shape[0]
+        inputs_bxtxd = data['inputs']
+        batch_size = inputs_bxtxd.shape[0]
 
-		# Expand initial hidden state to match batch size. This creates a new
-		# view without actually creating a new copy of it in memory.
-		initial_hiddens_1xbxh = self.initial_hiddens_1xh.expand(
-			1, batch_size, self.n_hidden)
+        # Expand initial hidden state to match batch size. This creates a new
+        # view without actually creating a new copy of it in memory.
+        initial_hiddens_1xbxh = self.initial_hiddens_1xh.expand(
+            1, batch_size, self.n_hidden)
 
-		if self._is_lstm:
-			initial_cell_1xbxd = self.initial_cell_1xd.expand(
-				1, batch_size, self.n_hidden)
+        if self._is_lstm:
+            initial_cell_1xbxd = self.initial_cell_1xd.expand(
+                1, batch_size, self.n_hidden)
 
-			initial_lstm_state = (initial_hiddens_1xbxh, initial_cell_1xbxd)
+            initial_lstm_state = (initial_hiddens_1xbxh, initial_cell_1xbxd)
 
-			# Pass the input through the RNN layer
-			hiddens_bxtxh, _ = self.rnn(inputs_bxtxd, initial_lstm_state)
+            # Pass the input through the RNN layer
+            hiddens_bxtxh, _ = self.rnn(inputs_bxtxd, initial_lstm_state)
 
-		elif self.rnn_type == 'griffin-recurrent-block':
-			# Pass the input through the RNN layer
-			(hiddens_bxtxh, rg_lru_state_traj_bxtxh), hn = self.rnn(inputs_bxtxd, initial_hiddens_1xbxh)  # returns hidden states for each timestep
-		else:
-			# Pass the input through the RNN layer
-			hiddens_bxtxh, hn = self.rnn(inputs_bxtxd, initial_hiddens_1xbxh)  # returns hidden states for each timestep
+        elif self.rnn_type == 'griffin-recurrent-block':
+            # Pass the input through the RNN layer
+            (hiddens_bxtxh, rg_lru_state_traj_bxtxh), hn = self.rnn(inputs_bxtxd,
+                                                                    initial_hiddens_1xbxh)  # returns hidden states for each timestep
+        else:
+            # Pass the input through the RNN layer
+            hiddens_bxtxh, hn = self.rnn(inputs_bxtxd, initial_hiddens_1xbxh)  # returns hidden states for each timestep
 
-		outputs_bxtxd = self.readout(hiddens_bxtxh)
+        outputs_bxtxd = self.readout(hiddens_bxtxh)
 
-		if self.rnn_type == 'griffin-recurrent-block':
-			return {
-				'output': outputs_bxtxd,
-				'hidden': hiddens_bxtxh,
-				'cache': rg_lru_state_traj_bxtxh,
-				}
-		else:
-			return {
-				'output': outputs_bxtxd,
-				'hidden': hiddens_bxtxh,
-			}
+        if self.rnn_type == 'griffin-recurrent-block':
+            return {
+                'output': outputs_bxtxd,
+                'hidden': hiddens_bxtxh,
+                'cache': rg_lru_state_traj_bxtxh,
+            }
+        else:
+            return {
+                'output': outputs_bxtxd,
+                'hidden': hiddens_bxtxh,
+            }
 
-	def predict(self, data):
-		''' Runs a forward pass through the model, starting with Numpy data and
-		returning Numpy data.
+    def predict(self, data):
+        ''' Runs a forward pass through the model, starting with Numpy data and
+        returning Numpy data.
 
-		Args:
-			data:
-				Numpy data dict as returned by FlipFlopData.generate_data()
+        Args:
+            data:
+                Numpy data dict as returned by FlipFlopData.generate_data()
 
-		Returns:
-			dict matching that returned by forward(), but with all tensors as
-			detached numpy arrays on cpu memory.
+        Returns:
+            dict matching that returned by forward(), but with all tensors as
+            detached numpy arrays on cpu memory.
 
-		'''
-		dataset = FlipFlopDataset(data, device=self.device)
-		pred_np = self._forward_np(dataset[:len(dataset)])
+        '''
+        dataset = FlipFlopDataset(data, device=self.device)
+        pred_np = self._forward_np(dataset[:len(dataset)])
 
-		return pred_np
+        return pred_np
 
 	def _tensor2numpy(self, data):
+    def _tensor2numpy(self, data):
 
-		np_data = {}
+        np_data = {}
 
-		for key, val in data.items():
-			np_data[key] = data[key].cpu().numpy()
+        for key, val in data.items():
+            np_data[key] = data[key].cpu().numpy()
 
-		return np_data
+        return np_data
 
-	def _forward_np(self, data):
+    def _forward_np(self, data):
 
-		with torch.no_grad():
-			pred = self.forward(data)
+        with torch.no_grad():
+            pred = self.forward(data)
 
-		pred_np = self._tensor2numpy(pred)
+        pred_np = self._tensor2numpy(pred)
 
-		return pred_np
+        return pred_np
 
-	def _loss(self, data, pred):
+    def _loss(self, data, pred):
 
-		return self._loss_fn(pred['output'], data['targets'])
+        return self._loss_fn(pred['output'], data['targets'])
 
-	def train(self, train_data, valid_data,
-		learning_rate=1.0,
-		batch_size=128,
-		min_loss=1e-4,
-		disp_every=1,
-		plot_every=5,
-		max_norm=1.,
-		max_epochs=400):
+    def train(self, train_data, valid_data,
+              learning_rate=1.0,
+              batch_size=128,
+              min_loss=1e-4,
+              disp_every=1,
+              plot_every=5,
+              max_norm=1.,
+              max_epochs=400):
 
-		train_dataset = FlipFlopDataset(train_data, device=self.device)
-		valid_dataset = FlipFlopDataset(valid_data, device=self.device)
+        train_dataset = FlipFlopDataset(train_data, device=self.device)
+        valid_dataset = FlipFlopDataset(valid_data, device=self.device)
 
-		dataloader = DataLoader(train_dataset,
-			shuffle=True,
-			batch_size=batch_size)
+        dataloader = DataLoader(train_dataset,
+                                shuffle=True,
+                                batch_size=batch_size)
 
-		# Create the optimizer
-		optimizer = optim.Adam(self.parameters(),
-			lr=learning_rate,
-			eps=0.001,
-			betas=(0.9, 0.999))
+        # Create the optimizer
+        optimizer = optim.Adam(self.parameters(),
+                               lr=learning_rate,
+                               eps=0.001,
+                               betas=(0.9, 0.999))
 
-		scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-			optimizer,
-			mode='min',
-			factor=.95,
-			patience=1,
-			cooldown=0)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=.95,
+            patience=1,
+            cooldown=0)
 
-		epoch = 0
-		losses = []
-		grad_norms = []
-		fig = None
+        epoch = 0
+        losses = []
+        grad_norms = []
+        fig = None
 
-		while epoch <= max_epochs:
+        while epoch <= max_epochs:
 
-			t_start = time.time()
+            t_start = time.time()
 
-			if epoch % plot_every == 0:
-				valid_pred = self._forward_np(valid_dataset[0:1])
-				fig = FlipFlopData.plot_trials(valid_data, valid_pred, fig=fig)
+            if epoch % plot_every == 0:
+                valid_pred = self._forward_np(valid_dataset[0:1])
+                fig = FlipFlopData.plot_trials(valid_data, valid_pred, fig=fig)
 
-			avg_loss, avg_norm = self._train_epoch(dataloader, optimizer)
+            avg_loss, avg_norm = self._train_epoch(dataloader, optimizer)
 
-			scheduler.step(metrics=avg_loss)
-			iter_learning_rate = scheduler.state_dict()['_last_lr'][0]
+            scheduler.step(metrics=avg_loss)
+            iter_learning_rate = scheduler.state_dict()['_last_lr'][0]
 
-			# Store the loss
-			losses.append(avg_loss)
-			grad_norms.append(avg_norm)
+            # Store the loss
+            losses.append(avg_loss)
+            grad_norms.append(avg_norm)
 
-			t_epoch = time.time() - t_start
+            t_epoch = time.time() - t_start
 
-			if epoch % disp_every == 0:
-				print('Epoch %d; loss: %.2e; grad norm: %.2e; learning rate: %.2e; time: %.2es' %
-					(epoch, losses[-1], grad_norms[-1], iter_learning_rate, t_epoch))
+            if epoch % disp_every == 0:
+                print('Epoch %d; loss: %.2e; grad norm: %.2e; learning rate: %.2e; time: %.2es' %
+                      (epoch, losses[-1], grad_norms[-1], iter_learning_rate, t_epoch))
 
-			if avg_loss < min_loss:
-				break
+            if avg_loss < min_loss:
+                break
 
-			epoch += 1
+            epoch += 1
 
-		valid_pred = self._forward_np(valid_dataset[0:1])
-		fig = FlipFlopData.plot_trials(valid_data, valid_pred, fig=fig)
+        valid_pred = self._forward_np(valid_dataset[0:1])
+        fig = FlipFlopData.plot_trials(valid_data, valid_pred, fig=fig)
 
-		return losses, grad_norms
+        return losses, grad_norms
 
-	def _train_epoch(self, dataloader, optimizer, verbose=False):
+    def _train_epoch(self, dataloader, optimizer, verbose=False):
 
-		n_trials = len(dataloader)
-		avg_loss = 0;
-		avg_norm = 0
+        n_trials = len(dataloader)
+        avg_loss = 0;
+        avg_norm = 0
 
-		for batch_idx, batch_data in enumerate(dataloader):
+        for batch_idx, batch_data in enumerate(dataloader):
 
-			step_summary = self._train_step(batch_data, optimizer)
+            step_summary = self._train_step(batch_data, optimizer)
 
-			# Add to the running loss average
-			avg_loss += step_summary['loss']/n_trials
+            # Add to the running loss average
+            avg_loss += step_summary['loss'] / n_trials
 
-			# Add to the running gradient norm average
-			avg_norm += step_summary['grad_norm']/n_trials
+            # Add to the running gradient norm average
+            avg_norm += step_summary['grad_norm'] / n_trials
 
-			if verbose:
-				print('\tStep %d; loss: %.2e; grad norm: %.2e; time: %.2es' %
-					(batch_idx,
-					step_summary['loss'],
-					step_summary['grad_norm'],
-					step_summary['time']))
+            if verbose:
+                print('\tStep %d; loss: %.2e; grad norm: %.2e; time: %.2es' %
+                      (batch_idx,
+                       step_summary['loss'],
+                       step_summary['grad_norm'],
+                       step_summary['time']))
 
-		return avg_loss, avg_norm
+        return avg_loss, avg_norm
 
-	def _train_step(self, batch_data, optimizer):
-		'''
-		Returns:
+    def _train_step(self, batch_data, optimizer):
+        '''
+        Returns:
 
-		'''
+        '''
 
-		t_start = time.time()
+        t_start = time.time()
 
+        # Run the model and compute loss
+        batch_pred = self.forward(batch_data)
+        loss = self._loss(batch_data, batch_pred)
 
-		# Run the model and compute loss
-		batch_pred = self.forward(batch_data)
-		loss = self._loss(batch_data, batch_pred)
+        # Run the backward pass and gradient descent step
+        optimizer.zero_grad()
+        loss.backward()
+        # nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+        optimizer.step()
 
-		# Run the backward pass and gradient descent step
-		optimizer.zero_grad()
-		loss.backward()
-		# nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
-		optimizer.step()
+        grad_norms = [p.grad.norm().cpu() for p in self.parameters()]
 
-		grad_norms = [p.grad.norm().cpu() for p in self.parameters()]
+        loss_np = loss.item()
+        grad_norm_np = np.mean(grad_norms)
 
-		loss_np = loss.item()
-		grad_norm_np = np.mean(grad_norms)
+        t_step = time.time() - t_start
 
-		t_step = time.time() - t_start
+        summary = {
+            'loss': loss_np,
+            'grad_norm': grad_norm_np,
+            'time': t_step
+        }
 
-		summary = {
-			'loss': loss_np,
-			'grad_norm': grad_norm_np,
-			'time': t_step
-		}
+        return summary
 
-		return summary
+    @classmethod
+    def _get_device(cls, verbose=False):
+        """
+        Set the device. CUDA if available, else MPS if available (Apple Silicon), CPU otherwise.
 
-	@classmethod
-	def _get_device(cls, verbose=False):
-		"""
-		Set the device. CUDA if available, else MPS if available (Apple Silicon), CPU otherwise.
+        Args:
+            None.
 
-		Args:
-			None.
+        Returns:
+            Device string ("cuda", "mps" or "cpu").
+        """
+        if torch.backends.cuda.is_built() and torch.cuda.is_available():
+            device = "cuda"
+            if verbose:
+                print("CUDA GPU enabled.")
+        else:
+            device = "cpu"
+            if verbose:
+                print("No GPU found. Running on CPU.")
 
-		Returns:
-			Device string ("cuda", "mps" or "cpu").
-		"""
-		if torch.backends.cuda.is_built() and torch.cuda.is_available():
-			device = "cuda"
-			if verbose:
-				print("CUDA GPU enabled.")
-		else:
-			device = "cpu"
-			if verbose:
-				print("No GPU found. Running on CPU.")
+        # I'm overriding here because of performance and correctness issues with
+        # Apple Silicon MPS: https://github.com/pytorch/pytorch/issues/94691
+        #
+        # elif torch.backends.mps.is_built() and torch.backends.mps.is_available():
+        # 	device = "mps"
+        # 	if verbose:
+        # 		print("Apple Silicon GPU enabled.")
 
-		# I'm overriding here because of performance and correctness issues with
-		# Apple Silicon MPS: https://github.com/pytorch/pytorch/issues/94691
-		#
-		# elif torch.backends.mps.is_built() and torch.backends.mps.is_available():
-		# 	device = "mps"
-		# 	if verbose:
-		# 		print("Apple Silicon GPU enabled.")
-
-		return device
+        return device
