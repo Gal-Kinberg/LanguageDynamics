@@ -797,6 +797,7 @@ class ModifiedRecurrentBlock(nn.Module):
       segment_pos: at.SegmentPos,
       cache: RecurrentBlockCache | None = None,
       return_cache: bool = True,
+      return_internals: bool = False,
   ) -> tuple[Tensor | Any, None] | tuple[Tensor | Any, Any, RecurrentBlockCache]:
     """Calls the recurrent block.
 
@@ -825,7 +826,7 @@ class ModifiedRecurrentBlock(nn.Module):
     )
     conv1d_state_traj_bxtxh = x
     # maybe need to output the entire x here?
-    x, rg_lru_state_1xbxh = self.rg_lru(
+    x, rg_lru_state_1xbxh, internals = self.rg_lru(
         x=x,
         segment_pos=segment_pos,
         cache=None if cache is None else cache.rg_lru_state,

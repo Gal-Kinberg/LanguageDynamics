@@ -202,7 +202,16 @@ class FlipFlop(nn.Module):
 
         return pred_np
 
-	def _tensor2numpy(self, data):
+    def compute_fixed_points(self, input_bxtxd: torch.Tensor):
+        if self.rnn_type == 'griffin-recurrent-block':
+            rg_lru_fixed_point_bx1xh, output_fixed_point_bx1xh = self.rnn.compute_fixed_point(input_bxtxd)
+        else:
+            return
+
+        outputs_bx1xd = self.readout(output_fixed_point_bx1xh)
+
+        return outputs_bx1xd, rg_lru_fixed_point_bx1xh, output_fixed_point_bx1xh
+
     def _tensor2numpy(self, data):
 
         np_data = {}

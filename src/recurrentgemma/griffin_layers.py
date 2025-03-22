@@ -16,14 +16,13 @@
 
 from collections.abc import Sequence
 import math
-from typing import overload, Literal
+from typing import overload, Literal, Any
 
 import einops
 from recurrentgemma import array_typing as at
 # from recurrentgemma.torch import array_typing as at
 import torch
-from torch import nn
-
+from torch import nn, Tensor
 
 _MAX_SQRT_GRADIENT = 1000.0
 
@@ -318,7 +317,9 @@ class RGLRU(nn.Module):
       segment_pos: at.SegmentPos,  # bxt
       cache: at.RNNState | None = None,  #bxh
       return_cache: bool = True,
-  ) -> tuple[at.ExpandedActivations, at.RNNState | None]:
+      return_internals: bool = False,
+  ) -> tuple[Tensor, Tensor, None] | tuple[Tensor, None, None] | tuple[Tensor, None, dict[str, Tensor | Any]] | tuple[
+      Tensor, Tensor, dict[str, Tensor | Any]]:
     """Calls the RG-LRU.
 
     Args:
@@ -360,10 +361,24 @@ class RGLRU(nn.Module):
         h0=cache,
     )
 
-    if not return_cache:
-      return y, None
+    if return_internals:
+      internals = {
+        "gate_x": gate_x,
+        "gate_a": gate_a,
+        "log_a": log_a,
+        "a": a,
+        "a_square": a_square,
+        "gated_x": gated_x,
+        "multiplier": multiplier,
+        "normalized_x": normalized_x,
+      }
+    else:
+      internals = None
 
-    return y, last_h
+    if not return_cache:
+      return y, None, internals
+
+    return y, last_h, internals
 
   @classmethod
   def init_cache(
