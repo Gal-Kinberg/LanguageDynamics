@@ -22,8 +22,9 @@ from fixed_point_finder.FixedPointFinderTorch import FixedPointFinderTorch as Fi
 from FlipFlopData import FlipFlopData
 from fixed_point_finder.plot_utils import plot_fps
 
+
 def train_FlipFlop(results_filename: str = 'flipflop_results.pth', save_results: bool = True,
-                   use_existing_results: bool = True,):
+                   use_existing_results: bool = True, ):
     ''' Train an RNN to solve the N-bit memory task.
 
         Args:
@@ -63,7 +64,7 @@ def train_FlipFlop(results_filename: str = 'flipflop_results.pth', save_results:
         n_hidden = 16
         batch_size = 128
         # rnn_type = 'tanh' # see note below
-        rnn_type = 'griffin-recurrent-block' # see note below
+        rnn_type = 'griffin-recurrent-block'  # see note below
 
         # Note: 'gru' should work in principle, and in the TF example it certainly does.
         # However, in this Pytorch example, fixed point finding in a GRU is not working
@@ -74,13 +75,13 @@ def train_FlipFlop(results_filename: str = 'flipflop_results.pth', save_results:
         valid_data = data_gen.generate_data(n_trials=n_valid)
 
         model = FlipFlop(
-            n_inputs=n_bits, # d
-            n_hidden=n_hidden, # h
-            n_outputs=n_bits, # d
+            n_inputs=n_bits,  # d
+            n_hidden=n_hidden,  # h
+            n_outputs=n_bits,  # d
             rnn_type=rnn_type)
 
         # learning_rate = 1./np.sqrt(batch_size)
-        learning_rate = 1./np.sqrt(batch_size)
+        learning_rate = 1. / np.sqrt(batch_size)
         losses, grad_norms = model.train(train_data, valid_data,
                                          learning_rate=learning_rate,
                                          batch_size=batch_size)
@@ -110,8 +111,8 @@ def find_fixed_points(model, valid_predictions):
         None.
     '''
 
-    NOISE_SCALE = 0.5 # Standard deviation of noise added to initial states
-    N_INITS = 1024 # The number of initial states to provide
+    NOISE_SCALE = 0.5  # Standard deviation of noise added to initial states
+    N_INITS = 1024  # The number of initial states to provide
 
     n_bits = valid_predictions['output'].shape[2]
 
@@ -130,7 +131,8 @@ def find_fixed_points(model, valid_predictions):
     '''Draw random, noise corrupted samples of those state trajectories
     to use as initial states for the fixed point optimizations.'''
     # valid_initial_states should be example trajectories of shape bxtxh (h is the full hidden state)
-    valid_initial_states = valid_predictions['cache'] if model.rnn_type == 'griffin-recurrent-block' else valid_predictions['hidden']
+    valid_initial_states = valid_predictions['cache'] if model.rnn_type == 'griffin-recurrent-block' else \
+    valid_predictions['hidden']
     initial_states = fpf.sample_states(valid_initial_states,
                                        n_inits=N_INITS,
                                        noise_scale=NOISE_SCALE)
@@ -150,13 +152,12 @@ def find_fixed_points(model, valid_predictions):
     return unique_fps
 
 
-def create_constant_flipflop_data(desired_inputs: np.ndarray, n_time = 300, active_fraction=0.5):
+def create_constant_flipflop_data(desired_inputs: np.ndarray, n_time=300, active_fraction=0.5):
     '''Creates FlipFlopData object and generates constant data.'''
     n_bits = desired_inputs.shape[1]
     data_gen = FlipFlopData(n_bits=n_bits, n_time=n_time)
     constant_data = data_gen.generate_constant_data(desired_inputs, active_fraction=active_fraction)
     return constant_data
-
 
 
 def plot_neurons(result_to_plot_txd, variable_name: str):
@@ -174,8 +175,6 @@ def plot_neurons(result_to_plot_txd, variable_name: str):
 if __name__ == '__main__':
     print("Current working directory:", os.getcwd())
 
-    do_find_fixed_points = False
-
     # Step 1: Train an RNN to solve the N-bit memory task
     results_filename = 'models/flipflop_results.pth'
     results_filename = os.path.abspath(results_filename)
@@ -186,6 +185,7 @@ if __name__ == '__main__':
     model, valid_predictions = train_FlipFlop(results_filename, save_results, use_existing_results)
 
     # STEP 2: Find, analyze, and visualize the fixed points of the trained RNN
+    do_find_fixed_points = False
     if do_find_fixed_points:
         unique_fps = find_fixed_points(model, valid_predictions)
 
@@ -196,13 +196,17 @@ if __name__ == '__main__':
     desired_inputs = np.array([[x, 0] for x in np.arange(0, 2.01, 0.01)])
     # desired_inputs = np.array([[0, 0]])
     constant_data = create_constant_flipflop_data(desired_inputs, n_time=n_time, active_fraction=active_fraction)
+
+    outputs_bx1xd, rg_lru_fixed_point_bx1xh, output_fixed_point_bx1xh = model.compute_fixed_points(
+        torch.from_numpy(constant_data['inputs']))
+
     constant_predictions = model.predict(constant_data)
-
-    outputs_bx1xd, rg_lru_fixed_point_bx1xh, output_fixed_point_bx1xh = model.compute_fixed_points(torch.from_numpy(constant_data['inputs']))
-
-    variable_to_plot = 'output'
-    for i in range(constant_predictions[f'{variable_to_plot}'].shape[0]):
-        plot_neurons(constant_predictions[f'{variable_to_plot}'][i], f'{variable_to_plot}')
+    
+    plot_predictions = False
+    if plot_predictions:
+        variable_to_plot = 'output'
+        for i in range(constant_predictions[f'{variable_to_plot}'].shape[0]):
+            plot_neurons(constant_predictions[f'{variable_to_plot}'][i], f'{variable_to_plot}')
 
     print('Entering debug mode to allow interaction with objects and figures.')
     print('You should see a figure with:')
