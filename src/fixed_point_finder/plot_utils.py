@@ -9,6 +9,7 @@ Please direct correspondence to mgolub@cs.washington.edu
 import numpy as np
 import pdb
 
+import torch
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
@@ -19,7 +20,8 @@ def plot_fps(fps,
     plot_start_time=0,
     plot_stop_time=None,
     mode_scale=0.25,
-    fig=None):
+    fig=None,
+    output_colors=None):
 
     '''Plots a visualization and analysis of the unique fixed points.
 
@@ -110,13 +112,13 @@ def plot_fps(fps,
 
         ax = fig.add_subplot(111, projection='3d')
         ax.set_xlabel('PC 1', fontweight=FONT_WEIGHT)
-        ax.set_zlabel('PC 3', fontweight=FONT_WEIGHT)
         ax.set_ylabel('PC 2', fontweight=FONT_WEIGHT)
+        ax.set_zlabel('PC 3', fontweight=FONT_WEIGHT)
 
         # For generating figure in paper.md
-        ax.set_xticks([-2, -1, 0, 1, 2])
-        ax.set_yticks([-1, 0, 1])
-        ax.set_zticks([-1, 0, 1])
+        # ax.set_xticks([-2, -1, 0, 1, 2])
+        # ax.set_yticks([-1, 0, 1])
+        # ax.set_zticks([-1, 0, 1])
     else:
         # For 1D or 0D networks (i.e., never)
         pca = None
@@ -131,12 +133,18 @@ def plot_fps(fps,
 
         for batch_idx in plot_batch_idx:
             x_idx = state_traj_bxtxd[batch_idx]
+            if output_colors is not None:
+                x_colors = torch.nn.functional.sigmoid(output_colors[batch_idx])
 
             if n_states >= 3:
                 z_idx = pca.transform(x_idx[plot_time_idx, :])
             else:
                 z_idx = x_idx[plot_time_idx, :]
-            plot_123d(ax, z_idx, color='b', linewidth=0.2)
+            if output_colors is not None:
+                # plot_123d(ax, z_idx, color=x_colors[plot_time_idx, :], linewidth=0.2)
+                ax.scatter(z_idx[:,0], z_idx[:,1],z_idx[:,2], c=x_colors[plot_time_idx,:], depthshade=True)
+            else:
+                plot_123d(ax, z_idx, color='b', linewidth=0.2)
 
     for init_idx in range(n_inits):
         plot_fixed_point(
@@ -149,7 +157,7 @@ def plot_fps(fps,
     plt.show()
     plt.pause(1e-10)
     
-    return fig
+    return fig, pca
 
 def plot_fixed_point(ax, fp, pca,
 	scale=1.0,
