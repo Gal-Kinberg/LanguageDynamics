@@ -59,6 +59,7 @@ def train_FlipFlop(results_filename: str = 'flipflop_results.pth', save_results:
         n_time = 300
         n_train = 512
         n_valid = 128
+        p = 0.5
 
         # Model hyperparameters
         n_hidden = 16
@@ -70,7 +71,7 @@ def train_FlipFlop(results_filename: str = 'flipflop_results.pth', save_results:
         # However, in this Pytorch example, fixed point finding in a GRU is not working
         # as expected.
 
-        data_gen = FlipFlopData(n_bits=n_bits, n_time=n_time)
+        data_gen = FlipFlopData(n_bits=n_bits, n_time=n_time, p=p)
         train_data = data_gen.generate_data(n_trials=n_train)
         valid_data = data_gen.generate_data(n_trials=n_valid)
 

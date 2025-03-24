@@ -5,11 +5,9 @@ Written for Python 3.8.17
 Please direct correspondence to mgolub@cs.washington.edu
 '''
 
-import os
-import sys
+import matplotlib.pyplot as plt
 import numpy as np
 import numpy.random as npr
-import matplotlib.pyplot as plt
 
 
 class FlipFlopData(object):
