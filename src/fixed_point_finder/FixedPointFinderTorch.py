@@ -34,6 +34,7 @@ class FixedPointFinderTorch(FixedPointFinderBase):
         lr_patience=5,
         lr_factor=0.95,
         lr_cooldown=0,
+        autoregressive_mode=False,
         **kwargs):
         '''Creates a FixedPointFinder object.
 
@@ -62,6 +63,7 @@ class FixedPointFinderTorch(FixedPointFinderBase):
         self.lr_patience = lr_patience
         self.lr_factor = lr_factor
         self.lr_cooldown = lr_cooldown
+        self.autoregressive_mode = autoregressive_mode
 
         super().__init__(rnn, **kwargs)
         self.torch_dtype = getattr(torch, self.dtype)
@@ -123,9 +125,9 @@ class FixedPointFinderTorch(FixedPointFinderBase):
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 
             mode='min',
-            factor=.95,
-            patience=2,
-            cooldown=0)
+            factor=self.lr_factor,
+            patience=self.lr_patience,
+            cooldown=self.lr_cooldown)
 
         iter_count = 1
         iter_learning_rate = init_lr
@@ -133,8 +135,10 @@ class FixedPointFinderTorch(FixedPointFinderBase):
         q_prev_b = torch.full((n_batch,), float('nan'), device=self.device)
 
         while True:
-            
-            F_x_bx1xh, F_x_1xbxh = self.rnn(inputs_bx1xd, x_1xbxh)
+            if self.autoregressive_mode:
+                F_x_bx1xh, F_x_1xbxh = self.rnn.autoregressive_step(inputs_bx1xd, x_1xbxh)
+            else:
+                F_x_bx1xh, F_x_1xbxh = self.rnn(inputs_bx1xd, x_1xbxh)
 
             dx_bxd = torch.squeeze(x_1xbxh - F_x_1xbxh)
             q_b = 0.5 * torch.sum(torch.square(dx_bxd), axis=1)
@@ -299,7 +303,10 @@ class FixedPointFinderTorch(FixedPointFinderBase):
                 # Unsqueeze to promote appropriate broadcasting
                 x_1xbxd = x_bxd.unsqueeze(0)
 
-                _, F_x_1xbxd = self.rnn(inputs_bx1xd, x_1xbxd)
+                if self.autoregressive_mode:
+                    F_x_bx1xh, F_x_1xbxd = self.rnn.autoregressive_step(inputs_bx1xd, x_1xbxd)
+                else:
+                    _, F_x_1xbxd = self.rnn(inputs_bx1xd, x_1xbxd)
 
                 F_x_bxd = F_x_1xbxd.squeeze(0)
                 return F_x_bxd
@@ -338,7 +345,10 @@ class FixedPointFinderTorch(FixedPointFinderBase):
                 # Unsqueeze to promote appropriate broadcasting
                 x_1xbxd = x_bxd.unsqueeze(0)
 
-                _, F_x_1xbxd = self.rnn(inputs_bx1xd, x_1xbxd)
+                if self.autoregressive_mode:
+                    F_x_bx1xh, F_x_1xbxd = self.rnn.autoregressive_step(inputs_bx1xd, x_1xbxd)
+                else:
+                    _, F_x_1xbxd = self.rnn(inputs_bx1xd, x_1xbxd)
 
                 F_x_bxd = F_x_1xbxd.squeeze(0)
                 return F_x_bxd
@@ -355,7 +365,10 @@ class FixedPointFinderTorch(FixedPointFinderBase):
                 x_1xbxd = x_d.unsqueeze(0).unsqueeze(1)
                 inputs_bx1xd = inputs_d.unsqueeze(0).unsqueeze(1)
 
-                _, F_x_1xbxd = self.rnn(inputs_bx1xd, x_1xbxd)
+                if self.autoregressive_mode:
+                    F_x_bx1xh, F_x_1xbxd = self.rnn.autoregressive_step(inputs_bx1xd, x_1xbxd)
+                else:
+                    _, F_x_1xbxd = self.rnn(inputs_bx1xd, x_1xbxd)
 
                 F_x_d = F_x_1xbxd.squeeze()
                 return F_x_d

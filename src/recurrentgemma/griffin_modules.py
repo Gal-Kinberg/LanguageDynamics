@@ -798,7 +798,7 @@ class ModifiedRecurrentBlock(nn.Module):
       cache: RecurrentBlockCache | None = None,
       return_cache: bool = True,
       return_internals: bool = False,
-  ) -> tuple[Tensor | Any, None] | tuple[Tensor | Any, Any, RecurrentBlockCache]:
+  ) -> tuple[Tensor | Any, None] | tuple[Tensor | Any, Any, Tensor, RecurrentBlockCache]:
     """Calls the recurrent block.
 
     Args:
@@ -841,7 +841,7 @@ class ModifiedRecurrentBlock(nn.Module):
     if not return_cache:
       return x, None
 
-    return x, rg_lru_state_traj_bxtxh, RecurrentBlockCache(
+    return x, rg_lru_state_traj_bxtxh, y, RecurrentBlockCache(
         conv1d_state=conv1d_state_bxdxh,
         rg_lru_state=rg_lru_state_1xbxh,
     )
