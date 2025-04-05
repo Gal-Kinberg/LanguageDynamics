@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 
-from DynamicSystemData import DynamicSystemData, dynamic_system_cubed
+from DynamicSystemData import DynamicSystemData, dynamic_system_cubed, simple_pendulum
 from FlipFlop import FlipFlop
 
 from fixed_point_finder.FixedPointFinderTorch import FixedPointFinderTorch as FixedPointFinder
@@ -83,18 +83,18 @@ if __name__ == '__main__':
     n_trials = 10
     time_span = (0, 5)
     timesteps = 300
-    data_gen = DynamicSystemData(dynamic_system=dynamic_system_cubed)
+    data_gen = DynamicSystemData(dynamic_system=simple_pendulum, n_dim=2)
     generated_data = data_gen.generate_data(n_trials, time_span, timesteps)
 
     # Configuration
     use_existing_results = True
-    save_results = False
+    save_results = True
     do_find_autoregressive_fps = False
     do_find_constant_fps = False
 
     n_hidden = 16
     rnn_type = "griffin-recurrent-block"
-    results_filename = "models/cubed_dynamic_system_results.pth"
+    results_filename = "models/simple_pendulum_results.pth"
 
     n_train = 512
     n_valid = 128
@@ -125,7 +125,8 @@ if __name__ == '__main__':
         learning_rate = 1. / np.sqrt(batch_size)
         losses, grad_norms = model.train(train_data, valid_data,
                                          learning_rate=learning_rate,
-                                         batch_size=batch_size)
+                                         batch_size=batch_size,
+                                         min_loss=2e-4)
         valid_predictions = model.predict(valid_data)
 
         # Save the model and predictions for later
