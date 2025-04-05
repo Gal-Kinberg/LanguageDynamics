@@ -7,6 +7,8 @@ from FlipFlop import FlipFlop
 
 from fixed_point_finder.FixedPointFinderTorch import FixedPointFinderTorch as FixedPointFinder
 from fixed_point_finder.plot_utils import plot_fps
+from run_FlipFlop import create_constant_flipflop_data
+from utils import plot_fps_plotly, fit_pca, create_plot
 
 
 def find_autoregressive_fixed_points(model, valid_predictions,
@@ -69,6 +71,10 @@ def find_autoregressive_fixed_points(model, valid_predictions,
                         plot_batch_idx=list(range(30)),
                         plot_start_time=10)
 
+    fig, pca = plot_fps_plotly(unique_fps, valid_initial_states,
+                        plot_batch_idx=list(range(30)),
+                        plot_start_time=10)
+
     return unique_fps, pca
 
 
@@ -83,6 +89,8 @@ if __name__ == '__main__':
     # Configuration
     use_existing_results = True
     save_results = False
+    do_find_autoregressive_fps = False
+    do_find_constant_fps = False
 
     n_hidden = 16
     rnn_type = "griffin-recurrent-block"
@@ -140,4 +148,19 @@ if __name__ == '__main__':
     NOISE_SCALE = 0.5  # Standard deviation of noise added to initial states
     N_INITS = 1024  # The number of initial states to provide
 
-    unique_fps, pca = find_autoregressive_fixed_points(model, valid_predictions, NOISE_SCALE, N_INITS)
+    if do_find_autoregressive_fps:
+        unique_fps, pca = find_autoregressive_fixed_points(model, valid_predictions, NOISE_SCALE, N_INITS)
+        # torch.save({'model': model, 'valid_predictions': valid_predictions, 'unique_fps': unique_fps, 'pca': pca}, results_filename)
+
+    if do_find_constant_fps:
+        # test constant data
+        n_time = 10
+        active_fraction = 1
+        # desired_inputs = np.array([[-1, -1], [-1, 1], [1, -1], [1, 1], ])
+        # desired_inputs = np.array([[-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1], [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1],])
+        desired_inputs = np.array([[x] for x in np.arange(-2.0, 2.01, 0.01)])
+        # desired_inputs = np.array([[0, 0]])
+        constant_data = create_constant_flipflop_data(desired_inputs, n_time=n_time, active_fraction=active_fraction)
+
+        outputs_bx1xd, rg_lru_fixed_point_bx1xh, output_fixed_point_bx1xh = model.compute_fixed_points(
+            torch.from_numpy(constant_data['inputs']))
