@@ -88,7 +88,7 @@ if __name__ == '__main__':
 
     # Configuration
     use_existing_results = True
-    save_results = True
+    save_results = False
     do_find_autoregressive_fps = False
     do_find_constant_fps = False
 
