@@ -7,6 +7,8 @@ Please direct correspondence to mgolub@cs.washington.edu
 
 import sys
 import time
+from typing import Tuple
+
 import numpy as np
 
 import torch
@@ -117,6 +119,7 @@ class FlipFlop(nn.Module):
                                     )
 
         elif self.rnn_type == 'griffin-recurrent-block':
+            self.initial_y_state_1xh = nn.Parameter(zeros_1xh)
             self.rnn = GriffinRecurrentBlock(n_inputs, n_hidden,
                                              batch_first=True,
                                              device=self.device
@@ -165,9 +168,15 @@ class FlipFlop(nn.Module):
             hiddens_bxtxh, _ = self.rnn(inputs_bxtxd, initial_lstm_state)
 
         elif self.rnn_type == 'griffin-recurrent-block':
+            initial_y_state_1xbxd = self.initial_y_state_1xh.expand(
+                1, batch_size, self.n_hidden)
+
+            initial_griffin_state = (initial_hiddens_1xbxh, initial_y_state_1xbxd, None)  # None is the conv1d state
+
             # Pass the input through the RNN layer
-            (hiddens_bxtxh, rg_lru_state_traj_bxtxh, y_bxtxh), hn = self.rnn(inputs_bxtxd,
-                                                                    initial_hiddens_1xbxh)  # returns hidden states for each timestep
+            (z_bxtxh, recurrent_block_internals), output_cache_tuple = self.rnn(inputs_bxtxd,
+                                                                                initial_griffin_state)  # returns hidden states for each timestep
+            hiddens_bxtxh = z_bxtxh
         else:
             # Pass the input through the RNN layer
             hiddens_bxtxh, hn = self.rnn(inputs_bxtxd, initial_hiddens_1xbxh)  # returns hidden states for each timestep
@@ -178,8 +187,7 @@ class FlipFlop(nn.Module):
             return {
                 'output': outputs_bxtxd,
                 'hidden': hiddens_bxtxh,
-                'cache': rg_lru_state_traj_bxtxh,
-                'y': y_bxtxh
+                'recurrent_block_internals': recurrent_block_internals
             }
         else:
             return {
@@ -207,7 +215,8 @@ class FlipFlop(nn.Module):
 
     def compute_fixed_points(self, input_bxtxd: torch.Tensor):
         if self.rnn_type == 'griffin-recurrent-block':
-            rg_lru_fixed_point_bx1xh, output_fixed_point_bx1xh = self.rnn.compute_fixed_point(input_bxtxd)
+            rg_lru_fixed_point_bx1xh, output_fixed_point_bx1xh = self.rnn.recurrent_block.compute_fixed_point(
+                input_bxtxd)
         else:
             return
 
@@ -215,25 +224,92 @@ class FlipFlop(nn.Module):
 
         return outputs_bx1xd, rg_lru_fixed_point_bx1xh, output_fixed_point_bx1xh
 
-    def autoregressive_step(self, input_dummy, input_state_1xbxh: torch.Tensor):
-        input_state_bxtxh = input_state_1xbxh.permute(1, 0, 2)
-        if self.rnn_type == "griffin-recurrent-block":
-            # extract state
-            state_bxtxh = input_state_bxtxh[:,:,:self.n_hidden] * input_state_bxtxh[:,:,self.n_hidden:]
-        else:
-            state_bxtxh = input_state_bxtxh
+    def generate_from_input(
+            self,
+            input_bxd: torch.Tensor,
+            initial_state_tuple: Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,  # each of shape 1xbxh
+            generation_steps: int = 1
+    ):
+        batch_size, _ = input_bxd.shape
 
-        first_output_bxtxd = self.readout(state_bxtxh)
+        # initialize outputs
+        z_bxtxh = torch.zeros(batch_size, generation_steps, self.n_hidden)
+        outputs_bxtxd = torch.zeros(batch_size, generation_steps, self.n_inputs)
+        recurrent_block_internals_list = []
 
-        if self.rnn_type == "griffin-recurrent-block":
-            new_output_bx1xh, rg_lru_new_state_bx1xh, y_bxtxh = self.rnn.autoregressive_step(first_output_bxtxd, input_state_bxtxh)
-            new_state_bxtxh = torch.cat([rg_lru_new_state_bx1xh, y_bxtxh[:,0:1,:]], 2)
-            new_state_1xbxh = new_state_bxtxh.permute(1, 0, 2)
-            return (new_output_bx1xh, rg_lru_new_state_bx1xh, y_bxtxh), new_state_1xbxh
-        else:
-            # TODO - not yet implemented
-            pass
+        # initialize inputs
+        inputs_bx1xd = input_bxd.unsqueeze(1)
+        current_state_tuple = initial_state_tuple
 
+        for step in range(generation_steps):
+            (z_bx1xh, recurrent_block_internals), output_cache_tuple = self.rnn(inputs_bx1xd,
+                                                                                current_state_tuple)  # returns hidden states for each timestep
+            z_bxtxh[:, step] = z_bx1xh[:, 0]
+            outputs_bxtxd[:, step] = self.readout(z_bx1xh)[:, 0]
+            inputs_bx1xd = outputs_bxtxd[:, step:(step+1)]
+            recurrent_block_internals_list.append(recurrent_block_internals)
+            current_state_tuple = output_cache_tuple  # update the state
+
+        return z_bxtxh, outputs_bxtxd, recurrent_block_internals_list, current_state_tuple
+
+    def generate_from_state(
+            self,
+            initial_state_tuple: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            generation_steps: int = 1
+    ):
+        # extract state
+        _, batch_size, _ = initial_state_tuple[0].shape
+
+        # initialize outputs
+        z_bxtxh = torch.zeros(batch_size, generation_steps + 1, self.n_hidden)
+        outputs_bxtxd = torch.zeros(batch_size, generation_steps + 1, self.n_inputs)
+        recurrent_block_internals_list = []
+
+        # initialize inputs
+        current_state_tuple = initial_state_tuple
+        (lru_current_state_1xbxh, y_current_state_1xbxh, conv1d_current_state_1xbxhd) = current_state_tuple
+        z_bx1xh = self.rnn.recurrent_block.state_to_output(lru_current_state_1xbxh, y_current_state_1xbxh).permute(
+            1, 0, 2)
+        z_bxtxh[:, 0] = z_bx1xh[:, 0]
+        outputs_bxtxd[:, 0] = self.readout(z_bx1xh)[:, 0]
+        inputs_bx1xd = outputs_bxtxd[:, 0:1]
+        recurrent_block_internals_list.append(None)
+
+        for step in range(1, generation_steps):
+            (z_bx1xh, recurrent_block_internals), output_cache_tuple = self.rnn(inputs_bx1xd,
+                                                                                current_state_tuple)  # returns hidden states for each timestep
+            z_bxtxh[:, step] = z_bx1xh[:, 0]
+            outputs_bxtxd[:, step] = self.readout(z_bx1xh)[:, 0]
+            inputs_bx1xd = outputs_bxtxd[:, step:(step+1)]
+            recurrent_block_internals_list.append(recurrent_block_internals)
+            current_state_tuple = output_cache_tuple  # update the state
+
+        return z_bxtxh, outputs_bxtxd, recurrent_block_internals_list, current_state_tuple
+
+    def autoregressive_step(self, input_dummy, initial_state_tuple):
+        z_bxtxh, outputs_bxtxd, recurrent_block_internals_list, new_state_tuple = self.generate_from_state(initial_state_tuple)
+        return (z_bxtxh, outputs_bxtxd, recurrent_block_internals_list), new_state_tuple
+
+
+    # def autoregressive_step(self, input_dummy, input_state_1xbxh: torch.Tensor):
+    #     input_state_bxtxh = input_state_1xbxh.permute(1, 0, 2)
+    #     if self.rnn_type == "griffin-recurrent-block":
+    #         # extract state
+    #         state_bxtxh = input_state_bxtxh[:, :, :self.n_hidden] * input_state_bxtxh[:, :, self.n_hidden:]
+    #     else:
+    #         state_bxtxh = input_state_bxtxh
+    #
+    #     first_output_bxtxd = self.readout(state_bxtxh)
+    #
+    #     if self.rnn_type == "griffin-recurrent-block":
+    #         new_output_bx1xh, rg_lru_new_state_bx1xh, y_bxtxh = self.rnn.autoregressive_step(first_output_bxtxd,
+    #                                                                                          input_state_bxtxh)
+    #         new_state_bxtxh = torch.cat([rg_lru_new_state_bx1xh, y_bxtxh[:, 0:1, :]], 2)
+    #         new_state_1xbxh = new_state_bxtxh.permute(1, 0, 2)
+    #         return (new_output_bx1xh, rg_lru_new_state_bx1xh, y_bxtxh), new_state_1xbxh
+    #     else:
+    #         # TODO - not yet implemented
+    #         pass
 
     def _tensor2numpy(self, data):
 
