@@ -1,18 +1,18 @@
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 
 
 class DynamicSystemData:
 
-    def __init__(self, dynamic_system=None):
+    def __init__(self, dynamic_system=None, n_dim=1):
         """
 
         """
 
         self.dynamic_system = dynamic_system
+        self.n_dim = n_dim  # dimension of the state of the system
 
-    def generate_data(self, n_trials: int = 100, time_span = (0,10), n_timesteps: int = 300):
+    def generate_data(self, n_trials: int = 100, time_span=(0, 10), n_timesteps: int = 300):
         """
         Generates time-series data for a dynamic system by simulating multiple
         trials over a specified time span. Each trial starts with a randomly
@@ -33,7 +33,7 @@ class DynamicSystemData:
             - x_data_bxtxd: A numpy array containing the simulated data for
               each trial, where the first dimension indexes the trials, and
               the second dimension indexes the timestep.
-            - initial_states_bx1: A numpy array of the randomly sampled initial
+            - initial_states_bxd: A numpy array of the randomly sampled initial
               states used as initial conditions for each trial.
             - targets_bxtxd: A numpy array like x_data_bxtxd but shifted by one
               timestep to represent the predicted next value. The last
@@ -45,31 +45,37 @@ class DynamicSystemData:
         t = np.linspace(time_span[0], time_span[1], n_timesteps)
 
         # Store all the results
-        x_data_bxtxd = np.zeros((n_trials, n_timesteps, 1))
+        x_data_bxtxd = np.zeros((n_trials, n_timesteps, self.n_dim))
 
         # sample initial states
-        initial_states_bx1 = np.random.randn(n_trials)
+        initial_states_bxd = np.random.randn(n_trials, self.n_dim)
 
         # run simulations for each trial
         for trial in range(n_trials):
-            initial_state = initial_states_bx1[trial]
+            initial_state = initial_states_bxd[trial]
 
             # run the simulation
-            sol = solve_ivp(self.dynamic_system, time_span, [initial_state], t_eval=t, method='RK45')
+            sol = solve_ivp(self.dynamic_system, time_span, initial_state, t_eval=t, method='RK45')
 
             # save the results
-            x_data_bxtxd[trial, :, 0] = sol.y[0]
+            x_data_bxtxd[trial] = sol.y.T
 
         # Create the "targets_bxtxd" vector by shifting x_data_bxtxd by one timestep
         targets_bxtxd = x_data_bxtxd[:, 1:, :]
 
         return {
-            "inputs": x_data_bxtxd[:, :-1, :].astype(np.float32),
-            "targets": targets_bxtxd.astype(np.float32),
-            "initial_states": initial_states_bx1,
+            "inputs": x_data_bxtxd[:, :-1, :1].astype(np.float32),
+            "targets": targets_bxtxd[:, :, :1].astype(np.float32),
+            "initial_states": initial_states_bxd,
             "t": t[:-1]
         }
 
 
 def dynamic_system_cubed(t, x):
     return x - x ** 3
+
+
+def simple_pendulum(t, x):
+    g = 9.81
+    L = 1
+    return np.array([x[1], (-g / L) * np.sin(x[0])])
