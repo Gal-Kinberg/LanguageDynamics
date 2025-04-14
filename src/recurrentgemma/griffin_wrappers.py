@@ -148,7 +148,7 @@ class GriffinRecurrentBlock(nn.Module):
 
     def forward(
             self, input_bxtxd: torch.Tensor, hx: Optional[torch.Tensor] = None
-    ) -> tuple[tuple[Any, Any], Any]:
+    ) -> tuple[tuple[Any, Any, Any], Any]:
         """
         Forward pass through the RecurrentBlock.
 
@@ -189,7 +189,7 @@ class GriffinRecurrentBlock(nn.Module):
             segment_pos = torch.arange(seq_len, device=input_bxtxd.device).unsqueeze(0).expand(batch_size, -1)
 
         # Forward through the RecurrentBlock.
-        output, rg_lru_state_traj_bxtxh, output_cache = self.recurrent_block(input_bxtxd, segment_pos, input_cache,
+        output, rg_lru_state_traj_bxtxh, y_bxtxh, output_cache = self.recurrent_block(input_bxtxd, segment_pos, input_cache,
                                                                              return_cache=True)
         # conv1d_cache_out = output_cache.conv1d_state.reshape(1, batch_size, -1)
         # hn = torch.cat([output_cache.rg_lru_state, conv1d_cache_out], dim=2)
@@ -200,7 +200,7 @@ class GriffinRecurrentBlock(nn.Module):
             # Adjust output back to batch-first mode.
             output = output.transpose(0, 1)
 
-        return (output, rg_lru_state_traj_bxtxh), hn
+        return (output, rg_lru_state_traj_bxtxh, y_bxtxh), hn
 
     def compute_fixed_point(self, input_bxtxd: torch.Tensor
                             ) -> tuple[tuple[Any, Any], Any]:
@@ -258,6 +258,49 @@ class GriffinRecurrentBlock(nn.Module):
         output_fixed_point = rg_lru_fixed_point * y_bxtxh[:, 0:1, :]
 
         return rg_lru_fixed_point, output_fixed_point
+
+    def autoregressive_step(self, input_bxtxd: torch.Tensor, state_bxtx2h: torch.Tensor):
+        # extract state
+        rg_rlu_state_bx1xh = state_bxtx2h[:,:,:self.hidden_size]  # extract the hidden state
+
+        # run autoregressive step
+        batch_size, seq_len, _ = input_bxtxd.shape
+
+        x1_bxtxh = self.recurrent_block.linear_x(input_bxtxd)
+        conv1D_cache_input_bxtemporalxh = x1_bxtxh[:, 0, :].unsqueeze(1).repeat(1,
+                                                                                self.recurrent_block.conv1d_temporal_width - 1,
+                                                                                1)
+        # Initialize the hidden state.
+        input_cache = RecurrentBlockCache(
+            rg_lru_state=rg_rlu_state_bx1xh.squeeze(dim=1),  # remove the time dimension
+            conv1d_state=conv1D_cache_input_bxtemporalxh)
+
+        # Create a segment_pos tensor which is only ones (no reset)
+        segment_pos = torch.ones((batch_size, 1), device=input_bxtxd.device)
+
+        x2_bx1xh, conv1d_state_bxdxh = self.recurrent_block.conv_1d(
+            x=x1_bxtxh[:, 0:1, :],
+            segment_pos=segment_pos,
+            cache=None if input_cache is None else input_cache.conv1d_state,
+            return_cache=True,
+        )
+
+        x3_bx1xh, rg_lru_state_1xbxh, rg_lru_internals = self.recurrent_block.rg_lru(
+            x=x2_bx1xh,
+            segment_pos=segment_pos,
+            cache=None if input_cache is None else input_cache.rg_lru_state,
+            return_cache=True,
+            return_internals=True,
+        )
+
+        # y branch.
+        y_bxtxh = self.recurrent_block.linear_y(input_bxtxd)
+        y_bxtxh = gelu(y_bxtxh)
+
+        new_output_bx1xh = x3_bx1xh * y_bxtxh[:, 0:1, :]
+
+        # return outputs and new state
+        return new_output_bx1xh, x3_bx1xh, y_bxtxh
 
 
 class GriffinResidualBlock(nn.Module):

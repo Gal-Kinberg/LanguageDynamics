@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.fx.experimental.proxy_tensor import not_implemented_log
 from torch.utils.data import Dataset, DataLoader
 
 from recurrentgemma.griffin_wrappers import RGLRUWrapper, GriffinRecurrentBlock
@@ -72,7 +73,7 @@ class FlipFlopDataset(Dataset):
 class FlipFlop(nn.Module):
 
     def __init__(self, n_inputs, n_hidden, n_outputs,
-                 rnn_type='tanh'):
+                 rnn_type='tanh', batch_first=True):
 
         super().__init__()
 
@@ -81,6 +82,7 @@ class FlipFlop(nn.Module):
         self.n_outputs = n_outputs  # d
         self.rnn_type = rnn_type.lower()
         self.device = self._get_device()
+        self.batch_first = batch_first
 
         zeros_1xh = torch.zeros(1, n_hidden, device=self.device)
 
@@ -164,7 +166,7 @@ class FlipFlop(nn.Module):
 
         elif self.rnn_type == 'griffin-recurrent-block':
             # Pass the input through the RNN layer
-            (hiddens_bxtxh, rg_lru_state_traj_bxtxh), hn = self.rnn(inputs_bxtxd,
+            (hiddens_bxtxh, rg_lru_state_traj_bxtxh, y_bxtxh), hn = self.rnn(inputs_bxtxd,
                                                                     initial_hiddens_1xbxh)  # returns hidden states for each timestep
         else:
             # Pass the input through the RNN layer
@@ -177,6 +179,7 @@ class FlipFlop(nn.Module):
                 'output': outputs_bxtxd,
                 'hidden': hiddens_bxtxh,
                 'cache': rg_lru_state_traj_bxtxh,
+                'y': y_bxtxh
             }
         else:
             return {
@@ -211,6 +214,26 @@ class FlipFlop(nn.Module):
         outputs_bx1xd = self.readout(output_fixed_point_bx1xh)
 
         return outputs_bx1xd, rg_lru_fixed_point_bx1xh, output_fixed_point_bx1xh
+
+    def autoregressive_step(self, input_dummy, input_state_1xbxh: torch.Tensor):
+        input_state_bxtxh = input_state_1xbxh.permute(1, 0, 2)
+        if self.rnn_type == "griffin-recurrent-block":
+            # extract state
+            state_bxtxh = input_state_bxtxh[:,:,:self.n_hidden] * input_state_bxtxh[:,:,self.n_hidden:]
+        else:
+            state_bxtxh = input_state_bxtxh
+
+        first_output_bxtxd = self.readout(state_bxtxh)
+
+        if self.rnn_type == "griffin-recurrent-block":
+            new_output_bx1xh, rg_lru_new_state_bx1xh, y_bxtxh = self.rnn.autoregressive_step(first_output_bxtxd, input_state_bxtxh)
+            new_state_bxtxh = torch.cat([rg_lru_new_state_bx1xh, y_bxtxh[:,0:1,:]], 2)
+            new_state_1xbxh = new_state_bxtxh.permute(1, 0, 2)
+            return (new_output_bx1xh, rg_lru_new_state_bx1xh, y_bxtxh), new_state_1xbxh
+        else:
+            # TODO - not yet implemented
+            pass
+
 
     def _tensor2numpy(self, data):
 
