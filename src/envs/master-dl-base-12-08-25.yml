@@ -1,0 +1,29 @@
+name: master-dl-base
+channels:
+  - conda-forge
+dependencies:
+  - pytorch
+  - torchvision
+  - torchaudio
+  - scipy
+  - matplotlib
+  - seaborn
+  - tqdm
+  - tensorboard
+  - plotly
+  - pandas
+  - numpy
+  - scikit-learn
+  - datasets
+  - jupyterlab
+  - ipython
+  - black
+  - isort
+  - ca-certificates
+  - certifi
+  - openssl
+  - transformers
+  - einops
+  - jaxtyping
+  - jupyter_http_over_ws
+prefix: C:\Users\Gankl\miniforge3\envs\master-dl-base
