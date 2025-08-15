@@ -4,3 +4,5 @@
 Datasets/
 
 **/__pycache__/
+models/*/*.png
+models/*/*.pt
