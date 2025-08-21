@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any, List
 import json
+import torch
 
 @dataclass
 class BaseConfig:
@@ -108,15 +109,31 @@ class TinyKoopmanAutoencoderConfig(TinyAutoencoderConfig):
 
 @dataclass
 class TrainingConfig(BaseConfig):
-    pass
+    lr: float = 2e-4
+    batch_size: int = 128
+
+@dataclass
+class TrainingKoopmanConfig(TrainingConfig):
+    reconstruction_coef: float = 1.0
+    koopman_coef: float = 1.0
+    regularization_coef: float = 0.0001
+    teacher_forcing: bool = False
 
 @dataclass
 class DataGenerationConfig(BaseConfig):
-    pass
+    max_depth: int = 4
+    min_length: int = 4
+    max_length: int = 50
 
 @dataclass
 class ExperimentConfig(BaseConfig):
-    pass
+    epochs: int = 500
+    checkpoint_path: str | None = None
+    save_every: int = 1
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model_config: TinyModelConfig = TinyModelConfig()
+    training_config: TrainingConfig = TrainingConfig()
+    data_generation_config: DataGenerationConfig = DataGenerationConfig()
 
 
 # CONFIG = {
