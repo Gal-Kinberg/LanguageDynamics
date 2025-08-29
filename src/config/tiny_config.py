@@ -27,6 +27,11 @@ class TinyModelConfig(BaseConfig):
     context_window: int = 32
 
 @dataclass
+class TinyTransformerConfig(TinyModelConfig):
+    causal_masking: bool = True
+    dropout: float = 0.03
+
+@dataclass
 class TinyLMConfig(TinyModelConfig):
     mode: str = field(default='LM', init=False)
     vocab: list[str] = ['(', ')', '[', ']', '<BOS>', '<EOS>', '<SOS>', '<CLS>']
@@ -111,6 +116,7 @@ class TinyKoopmanAutoencoderConfig(TinyAutoencoderConfig):
 class TrainingConfig(BaseConfig):
     lr: float = 2e-4
     batch_size: int = 128
+    grad_clipping: bool = True
 
 @dataclass
 class TrainingKoopmanConfig(TrainingConfig):
@@ -130,10 +136,15 @@ class ExperimentConfig(BaseConfig):
     epochs: int = 500
     checkpoint_path: str | None = None
     save_every: int = 1
+    device_index: int = 0
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
     model_config: TinyModelConfig = TinyModelConfig()
     training_config: TrainingConfig = TrainingConfig()
-    data_generation_config: DataGenerationConfig = DataGenerationConfig()
+    data_generation_config: Optional[DataGenerationConfig] = DataGenerationConfig()
+    model_save_prefix: str | None = None
+
+    def __post_init__(self):
+        self.device = f'cuda:{self.device_index}' if torch.cuda.is_available() else 'cpu'
 
 
 # CONFIG = {
