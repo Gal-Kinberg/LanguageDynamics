@@ -45,6 +45,8 @@ class RoPEMultiheadAttention(nn.Module):
         if self.causal_mask:
             causal_mask = torch.triu(torch.ones(S, S, device=x.device) * float('-inf'), diagonal=1)
 
+        #TODO: create "document mask" by <EOS> tokens
+
         qkv = self.qkv_proj(x)                # [B, S, 3E]
         q, k, v = qkv.chunk(3, dim=-1)        # [B, S, E] each
 
