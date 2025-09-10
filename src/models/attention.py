@@ -28,7 +28,7 @@ def generate_sinusoidal_embeddings(n_latents, embed_dim):
     return pe.unsqueeze(0) # [1, n_latents, embed_dim]
 
 class RoPEMultiheadAttention(nn.Module):
-    def __init__(self, embed_dim, n_heads, causal_mask=True, dropout=0.03):
+    def __init__(self, embed_dim, n_heads, eos_id, causal_mask=True, dropout=0.03):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = embed_dim // n_heads
@@ -36,6 +36,7 @@ class RoPEMultiheadAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
         self.causal_mask = causal_mask
+        self.eos_id = eos_id
 
     def forward(self, x):
         # x: [batch, seq, embed_dim]
@@ -46,6 +47,36 @@ class RoPEMultiheadAttention(nn.Module):
             causal_mask = torch.triu(torch.ones(S, S, device=x.device) * float('-inf'), diagonal=1)
 
         #TODO: create "document mask" by <EOS> tokens
+        # find EOS tokens
+        eos_indices = (x == self.eos_id).nonzero()  # shape: [-1, 3]
+
+        # create "document" ranges
+        # first range always starts at zero
+        # last range always ends at last index
+        # if no EOS was found, simply full range is allowed
+
+        # create the mask given the ranges
+
+        def create_document_attention_mask(doc_boundaries, seq_len):
+            # Initialize a mask with zeros
+            mask = torch.zeros(seq_len, seq_len, dtype=torch.bool)
+            
+            # Fill the mask based on document boundaries
+            for i in range(len(doc_boundaries)):
+                # Get the indices of the current document
+                start_i, end_i = doc_boundaries[i]
+                
+                # Mark attention within the current document as True
+                mask[start_i:end_i+1, start_i:end_i+1] = True
+            
+            return mask
+
+        # Create the mask for our example
+        seq_len = len(concatenated_tokens)
+        doc_mask = create_document_attention_mask(doc_boundaries, seq_len)
+
+        # Now, convert boolean mask to float mask for addition
+        attention_mask_float = doc_mask.float().masked_fill(doc_mask == 0, float('-inf'))
 
         qkv = self.qkv_proj(x)                # [B, S, 3E]
         q, k, v = qkv.chunk(3, dim=-1)        # [B, S, E] each

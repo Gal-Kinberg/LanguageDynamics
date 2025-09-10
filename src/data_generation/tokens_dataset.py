@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset
 
 
-class DyckDataset(Dataset):
+class TokensDataset(Dataset):
     def __init__(self, data_blocks):
         self.data = torch.tensor(data_blocks, dtype=torch.long)
 
@@ -14,7 +14,7 @@ class DyckDataset(Dataset):
         y = self.data[idx, 1:]
         return x, y
 
-class DyckAutoencoderDataset(Dataset):
+class TokensAutoencoderDataset(Dataset):
     def __init__(self, data_blocks):
         self.data = torch.tensor(data_blocks, dtype=torch.long)
 
