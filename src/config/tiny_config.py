@@ -34,7 +34,7 @@ class TinyTransformerConfig(TinyModelConfig):
 @dataclass
 class TinyLMConfig(TinyModelConfig):
     mode: str = field(default='LM', init=False)
-    vocab: list[str] = ['(', ')', '[', ']', '<BOS>', '<EOS>', '<SOS>', '<CLS>']
+    vocab: list = field(default_factory=list)
     dropout_self_attention: float = 0.05
     dropout_embed: float = 0.03
     dropout_residual: float = 0.03
@@ -138,9 +138,9 @@ class ExperimentConfig(BaseConfig):
     save_every: int = 1
     device_index: int = 0
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model_config: TinyModelConfig = TinyModelConfig()
-    training_config: TrainingConfig = TrainingConfig()
-    data_generation_config: Optional[DataGenerationConfig] = DataGenerationConfig()
+    model_config: TinyModelConfig = field(default_factory=TinyModelConfig)
+    training_config: TrainingConfig = field(default_factory=TrainingConfig)
+    data_generation_config: Optional[DataGenerationConfig] = field(default_factory=DataGenerationConfig)
     model_save_prefix: str | None = None
 
     def __post_init__(self):
