@@ -1,14 +1,14 @@
 import torch
 import torch.nn as nn
 from .attention import RoPEMultiheadAttention, MultiheadCrossAttention
-from ..config import TinyEncoderConfig, TinyDecoderConfig, TinyLMConfig
+from config import TinyEncoderConfig, TinyDecoderConfig, TinyLMConfig
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, n_heads, ffn_dim, dropout_residual=0.03, dropout_attention=0.03, causal_mask=True):
+    def __init__(self, embed_dim, n_heads, ffn_dim, eos_id, dropout_residual=0.03, dropout_attention=0.03, causal_mask=True):
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
-        self.attn = RoPEMultiheadAttention(embed_dim, n_heads, causal_mask=causal_mask, dropout=dropout_attention)
+        self.attn = RoPEMultiheadAttention(embed_dim, n_heads, eos_id=eos_id, causal_mask=causal_mask, dropout=dropout_attention)
         self.ln2 = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, ffn_dim),
@@ -16,6 +16,7 @@ class TransformerBlock(nn.Module):
             nn.Linear(ffn_dim, embed_dim)
         )
         self.dropout = nn.Dropout(dropout_residual)
+        self.eos_id = eos_id
 
     def forward(self, x):
         x = x + self.dropout(self.attn(self.ln1(x)))
@@ -23,10 +24,10 @@ class TransformerBlock(nn.Module):
         return x
 
 class TransformerDecoderBlock(nn.Module):
-    def __init__(self, embed_dim, n_heads, ffn_dim, latent_dim, n_latents, dropout_residual=0.03, dropout_attention=0.03):
+    def __init__(self, embed_dim, n_heads, ffn_dim, latent_dim, n_latents, eos_id, dropout_residual=0.03, dropout_attention=0.03):
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
-        self.attn = RoPEMultiheadAttention(embed_dim, n_heads, causal_mask=True)
+        self.attn = RoPEMultiheadAttention(embed_dim, n_heads, eos_id=eos_id, causal_mask=True)
         self.ln2 = nn.LayerNorm(embed_dim)
         self.cross_attention = MultiheadCrossAttention(embed_dim, latent_dim, n_latents, n_heads, dropout=dropout_attention)
         self.ln3 = nn.LayerNorm(embed_dim)
@@ -36,6 +37,7 @@ class TransformerDecoderBlock(nn.Module):
             nn.Linear(ffn_dim, embed_dim)
         )
         self.dropout = nn.Dropout(dropout_residual)
+        self.eos_id = eos_id
 
     def forward(self, x, z):
         x = x + self.dropout(self.attn(self.ln1(x)))
@@ -48,10 +50,11 @@ class TransformerEncoder(nn.Module):
     def __init__(self, config: TinyEncoderConfig):
         super().__init__()
         self.config = config
+        eos_id = config.vocab.index('<EOS>') if '<EOS>' in config.vocab else -1
         self.embed = nn.Embedding(len(config.vocab), config.embed_dim)
         self.embed_dropout = nn.Dropout(config.dropout_embed)
         self.layers = nn.ModuleList([
-            TransformerBlock(config.embed_dim, config.n_heads, config.ffn_dim, causal_mask=False, dropout_residual=config.dropout_residual, dropout_attention=config.dropout_self_attention) for _ in range(config.n_layers)
+            TransformerBlock(config.embed_dim, config.n_heads, config.ffn_dim, eos_id=eos_id, causal_mask=False, dropout_residual=config.dropout_residual, dropout_attention=config.dropout_self_attention) for _ in range(config.n_layers)
         ])
         self.latent_projection = nn.Linear(config.embed_dim, config.latent_dim, bias=False)
         self.layer_norm = nn.LayerNorm(config.embed_dim)
@@ -123,10 +126,11 @@ class TransformerDecoder(nn.Module):
     def __init__(self, config: TinyDecoderConfig):
         super().__init__()
         self.config = config
+        eos_id = config.vocab.index('<EOS>') if '<EOS>' in config.vocab else -1
         self.embed = nn.Embedding(len(config.vocab), config.embed_dim)
         self.embed_dropout = nn.Dropout(config.dropout_embed)
         self.layers = nn.ModuleList([
-            TransformerDecoderBlock(config.embed_dim, config.n_heads, config.ffn_dim, config.latent_dim, config.n_latent, dropout_residual=config.dropout_residual, dropout_attention=config.dropout_cross_attention) for _ in range(config.n_layers)
+            TransformerDecoderBlock(config.embed_dim, config.n_heads, config.ffn_dim, config.latent_dim, config.n_latent, eos_id=eos_id, dropout_residual=config.dropout_residual, dropout_attention=config.dropout_cross_attention) for _ in range(config.n_layers)
         ])
         self.head = nn.Linear(config.embed_dim, len(config.vocab), bias=False)
         self.ln_f = nn.LayerNorm(config.embed_dim)
@@ -159,10 +163,11 @@ class TinyLlamaTransformer(nn.Module):
     def __init__(self, config: TinyLMConfig):
         super().__init__()
         self.config = config
+        eos_id = config.vocab.index('<EOS>') if '<EOS>' in config.vocab else -1
         self.embed = nn.Embedding(len(config.vocab), config.embed_dim)
         self.pos_embed = None  # RoPE only
         self.layers = nn.ModuleList([
-            TransformerBlock(config.embed_dim, config.n_heads, config.ffn_dim, dropout_residual=config.dropout_residual, dropout_attention=config.dropout_self_attention) for _ in range(config.n_layers)
+            TransformerBlock(config.embed_dim, config.n_heads, config.ffn_dim, eos_id=eos_id, dropout_residual=config.dropout_residual, dropout_attention=config.dropout_self_attention) for _ in range(config.n_layers)
         ])
         self.ln_f = nn.LayerNorm(config.embed_dim)
         self.head = nn.Linear(config.embed_dim, len(config.vocab), bias=False)
@@ -228,8 +233,9 @@ class TinyLlamaRawTransformer(nn.Module):
     def __init__(self, config: TinyLMConfig):
         super().__init__()
         self.config = config
+        eos_id = config.vocab.index('<EOS>') if '<EOS>' in config.vocab else -1
         self.layers = nn.ModuleList([
-            TransformerBlock(config.embed_dim, config.n_heads, config.ffn_dim, dropout_residual=config.dropout_residual, dropout_attention=config.dropout_self_attention) for _ in range(config.n_layers)
+            TransformerBlock(config.embed_dim, config.n_heads, config.ffn_dim, eos_id=eos_id, dropout_residual=config.dropout_residual, dropout_attention=config.dropout_self_attention) for _ in range(config.n_layers)
         ])
         self.embed_dim = config.embed_dim
         self.ln_f = nn.LayerNorm(config.embed_dim)
