@@ -63,6 +63,7 @@ class TinyDecoderConfig(TinyLMConfig):
 class TinyAutoencoderConfig(TinyLMConfig):
     mode: str = field(default='AE', init=False)
     dropout_cross_attention: float = 0.03
+    dropout_latent: float = 0.03
     latent_dim: int = 32
     n_latent: int = 4
     sos_id: int | None = None
@@ -111,6 +112,33 @@ class TinyAutoencoderConfig(TinyLMConfig):
 @dataclass
 class TinyKoopmanAutoencoderConfig(TinyAutoencoderConfig):
     n_diagonals: int = 5
+
+@dataclass
+class TinyDVAEConfig(TinyLMConfig):
+    mode: str = field(default='DVAE', init=False)
+    latent_dim: int = 3
+    dropout_latent: float = 0.00
+    encoder_config: TinyLMConfig | None = field(default=None, init=False)
+    decoder_ffn_dim: int = 128
+    transition_ffn_dim: int = 128
+    pooling: str = 'mean'  # 'mean' or 'last'
+    decoder_ln: bool = False
+    transition_ln: bool = False
+
+    def __post_init__(self):
+
+        # initialize encoder and decoder configs
+        self.encoder_config = TinyLMConfig(
+            n_layers=self.n_layers,
+            n_heads=self.n_heads,
+            embed_dim=self.embed_dim,
+            ffn_dim=self.ffn_dim,
+            context_window=self.context_window,
+            vocab=self.vocab,
+            dropout_self_attention=self.dropout_self_attention,
+            dropout_embed=self.dropout_embed,
+            dropout_residual=self.dropout_residual,
+        )
 
 @dataclass
 class TrainingConfig(BaseConfig):
