@@ -1,285 +1,21 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import math
-
-# --------- 6. Transformer Model (Llama-inspired, RoPE) ---------
-# RoPE implementation (from Llama paper and HF)
-def apply_rope(x, base=10000.0, seq_dim=1):
-    # x: [batch, seq, n_heads, head_dim]
-    # RoPE mixes head_dim pairs
-    batch, seq, n_heads, head_dim = x.size()
-    half_dim = head_dim // 2
-    pos = torch.arange(seq, dtype=torch.float32, device=x.device)
-    idx = torch.arange(half_dim, dtype=torch.float32, device=x.device)
-    freq = torch.exp(-math.log(base) * idx / half_dim)
-    angles = pos[:, None] * freq[None, :]
-    cos, sin = torch.cos(angles), torch.sin(angles)
-    x1, x2 = x[..., :half_dim], x[..., half_dim:]
-    x_rope = torch.cat([x1 * cos[None, :, None, :] - x2 * sin[None, :, None, :],
-                        x1 * sin[None, :, None, :] + x2 * cos[None, :, None, :]], dim=-1)
-    return x_rope
-
-def generate_sinusoidal_embeddings(n_latents, embed_dim):
-    pe = torch.zeros(n_latents, embed_dim)
-    position = torch.arange(0, n_latents, dtype=torch.float).unsqueeze(1)
-    div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
-    pe[:, 0::2] = torch.sin(position * div_term)
-    pe[:, 1::2] = torch.cos(position * div_term)
-    return pe.unsqueeze(0) # [1, n_latents, embed_dim]
-
-class RoPEMultiheadAttention(nn.Module):
-    def __init__(self, embed_dim, n_heads, causal_mask=True, dropout=0.03):
-        super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = embed_dim // n_heads
-        self.qkv_proj = nn.Linear(embed_dim, embed_dim * 3, bias=False)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.causal_mask = causal_mask
-
-    def forward(self, x):
-        # x: [batch, seq, embed_dim]
-        B, S, E = x.shape
-
-        # Create causal mask
-        if self.causal_mask:
-            causal_mask = torch.triu(torch.ones(S, S, device=x.device) * float('-inf'), diagonal=1)
-
-        qkv = self.qkv_proj(x)                # [B, S, 3E]
-        q, k, v = qkv.chunk(3, dim=-1)        # [B, S, E] each
-
-        # reshape for multihead: [B, S, n_heads, head_dim]
-        def split_heads(t):
-            return t.view(B, S, self.n_heads, self.head_dim)
-        q, k, v = map(split_heads, (q, k, v))
-
-        # Apply RoPE to q and k
-        q, k = apply_rope(q), apply_rope(k)
-
-        # [B, n_heads, S, head_dim]
-        q, k, v = [x.permute(0,2,1,3) for x in (q,k,v)]
-
-        # Scaled dot-product attention
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.head_dim)
-        if self.causal_mask:
-            attn_weights = attn_weights + causal_mask[None, None, :, :]  ## MASK ADDED BY CLAUDE
-        attn_weights = self.dropout(attn_weights.softmax(dim=-1))  ## DROPOUT ADDED BY CLAUDE
-
-        attn_output = torch.matmul(attn_weights, v)   # [B, n_heads, S, head_dim]
-        attn_output = attn_output.permute(0,2,1,3).contiguous().view(B, S, E)
-        return self.out_proj(attn_output)
-
-class MultiheadCrossAttention(nn.Module):
-    def __init__(self, embed_dim, latent_dim, n_latents, n_heads, dropout=0.03):
-        super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = embed_dim // n_heads
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.k_proj = nn.Linear(latent_dim, embed_dim * n_latents, bias=False)
-        self.v_proj = nn.Linear(latent_dim, embed_dim * n_latents, bias=False)
-        # self.qkv_proj = nn.Linear(embed_dim, embed_dim * 3, bias=False)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.n_latents = n_latents
-
-        # Pre-compute and store sinusoidal positional encodings
-        pe = generate_sinusoidal_embeddings(self.n_latents, embed_dim)
-        self.register_buffer('positional_encodings', pe)
-
-    def forward(self, x, z):
-        # x: [batch, seq, embed_dim]
-        # z: [batch, 1, latent_dim]
-        B, S, E = x.shape
-
-        q = self.q_proj(x)                # [B, S, E]
-        k = self.k_proj(z)                # [B, 1, E * n_latents]
-        v = self.v_proj(z)                # [B, 1, E * n_latents]
-
-        k = k.view(B, self.n_latents, E)  # [B, n_latents, E]
-        v = v.view(B, self.n_latents, E)  # [B, n_latents, E]
-        # kv = kv.view(B, self.n_latents, E * 2)
-        # k, v = kv.chunk(2, dim=-1)        # [B, n_latents, E] each
-        # q, k, v = qkv.chunk(3, dim=-1)        # [B, S, E] each
-
-        # Add positional encodings to the Keys and Values
-        # The positional_encodings tensor is [1, n_latents, embed_dim] and will broadcast
-        k = k + self.positional_encodings
-        v = v + self.positional_encodings
-
-        # reshape for multihead: [B, S, n_heads, head_dim]
-        def split_heads(t):
-            return t.view(B, t.size(1), self.n_heads, self.head_dim)
-        q, k, v = map(split_heads, (q, k, v))
-
-        # [B, n_heads, S, head_dim]
-        q, k, v = [x.permute(0,2,1,3) for x in (q,k,v)]
-
-        # Scaled dot-product attention
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.head_dim)
-        attn_weights = self.dropout(attn_weights.softmax(dim=-1))  ## DROPOUT ADDED BY CLAUDE
-
-        attn_output = torch.matmul(attn_weights, v)   # [B, n_heads, S, head_dim]
-        attn_output = attn_output.permute(0,2,1,3).contiguous().view(B, S, E)
-        return self.out_proj(attn_output)
-
-class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, n_heads, ffn_dim, dropout=0.03, causal_mask=True):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(embed_dim)
-        self.attn = RoPEMultiheadAttention(embed_dim, n_heads, causal_mask=causal_mask)
-        self.ln2 = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, ffn_dim),
-            nn.GELU(),
-            nn.Linear(ffn_dim, embed_dim)
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = x + self.dropout(self.attn(self.ln1(x)))
-        x = x + self.dropout(self.ffn(self.ln2(x)))
-        return x
-
-class TransformerDecoderBlock(nn.Module):
-    def __init__(self, embed_dim, n_heads, ffn_dim, latent_dim, n_latents, dropout=0.03):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(embed_dim)
-        self.attn = RoPEMultiheadAttention(embed_dim, n_heads, causal_mask=True)
-        self.ln2 = nn.LayerNorm(embed_dim)
-        self.cross_attention = MultiheadCrossAttention(embed_dim, latent_dim, n_latents, n_heads)
-        self.ln3 = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, ffn_dim),
-            nn.GELU(),
-            nn.Linear(ffn_dim, embed_dim)
-        )
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, z):
-        x = x + self.dropout(self.attn(self.ln1(x)))
-        x = x + self.dropout(self.cross_attention(self.ln2(x), z))
-        x = x + self.dropout(self.ffn(self.ln3(x)))
-        return x
-
-class TransformerEncoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim, latent_dim, n_layers, n_heads, ffn_dim, context_window, cls_id, embed_dropout=0.03, normalize_before_projection=True):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.embed_dropout = nn.Dropout(embed_dropout)
-        self.layers = nn.ModuleList([
-            TransformerBlock(embed_dim, n_heads, ffn_dim, causal_mask=False) for _ in range(n_layers)
-        ])
-        self.latent_projection = nn.Linear(embed_dim, latent_dim, bias=False)
-        self.layer_norm = nn.LayerNorm(embed_dim)
-        self.context_window = context_window
-        self.cls_id = cls_id
-        self.normalize_before_projection = normalize_before_projection
-
-
-    def forward(self, x, return_internals=True):
-        """
-        Forward pass supporting token indices, probability distributions over tokens, or embedded vectors.
-
-        Args:
-            x (Tensor):
-                - [B, T] if token indices (int)
-                - [B, T, vocab_size] if probability distributions
-                - [B, T, embed_dim] if pre-computed embeddings
-            return_internals (bool): whether to return intermediate embeddings
-
-        Returns:
-            logits or (logits, initial_embeddings, final_embeddings)
-        """
-        B = x.size(0)
-        T = x.size(1)
-        E = self.embed.embedding_dim
-        V = self.embed.num_embeddings
-
-        if T > self.context_window:
-            raise ValueError(f"Input sequence length {T} exceeds context window {self.context_window}")
-
-        # Case 1: Token indices [B, T]
-        if x.ndim == 2:
-            # prepend [CLS] token
-            x = torch.concat([torch.full((B, 1), self.cls_id, dtype=torch.long, device=x.device), x], dim=1)  # [B, T+1]
-            x = self.embed(x)  # [B, T+1, E]
-
-        # Case 2: Probability distributions over vocabulary [B, T, V]
-        elif x.ndim == 3 and x.shape[2] == V:
-            # Ensure it sums to 1 along the vocab dimension
-            if not torch.allclose(x.sum(dim=2), torch.ones(B, T, device=x.device), atol=1e-4):
-                raise ValueError("Input probabilities must sum to 1 along vocab dimension.")
-            x = torch.matmul(x, self.embed.weight)  # [B, T, E]
-
-        # Case 3: Precomputed embeddings [B, T, E]
-        elif x.ndim == 3 and x.shape[2] == E:
-            pass  # already in embedded space
-
-        else:
-            raise ValueError(f"Unrecognized input shape: {x.shape}")
-
-        x = self.embed_dropout(x)
-        initial_embeddings = x.clone()
-
-        for layer in self.layers:
-            x = layer(x)
-
-        if self.normalize_before_projection:
-            x = self.layer_norm(x)
-        final_embeddings = x.clone()
-        latent = self.latent_projection(x[:,0])  # project only the [CLS] token
-
-        if return_internals:
-            return latent, initial_embeddings, final_embeddings
-        else:
-            return latent
-
-class TransformerDecoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim, latent_dim, n_layers, n_heads, ffn_dim, context_window, sos_id, n_latents=8, embed_dropout=0.03):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.embed_dropout = nn.Dropout(embed_dropout)
-        self.layers = nn.ModuleList([
-            TransformerDecoderBlock(embed_dim, n_heads, ffn_dim, latent_dim, n_latents) for _ in range(n_layers)
-        ])
-        self.head = nn.Linear(embed_dim, vocab_size, bias=False)
-        self.ln_f = nn.LayerNorm(embed_dim)
-        self.context_window = context_window
-        self.sos_id = sos_id
-
-    def forward(self, x, z, return_internals=True):
-        # x is the decoding seed, shape [B, T]
-        B, T = x.shape
-
-        # prepend <SOS> token
-        x = torch.concat([torch.full((B, 1), self.sos_id, dtype=torch.long, device=x.device), x], dim=1)  # [B, T+1]
-
-        x = self.embed(x)
-        x = self.embed_dropout(x)
-
-        for layer in self.layers:
-            x = layer(x, z)
-
-        x = self.ln_f(x)
-        final_embeddings = x.clone()
-        logits = self.head(x)
-        if return_internals:
-            return logits, final_embeddings
-        else:
-            return logits
+from .attention import RoPEMultiheadAttention, MultiheadCrossAttention
+from .transformers import TransformerBlock, TransformerDecoderBlock, TransformerEncoder, TransformerDecoder, TinyLlamaTransformer
+from config import TinyAutoencoderConfig, TinyKoopmanAutoencoderConfig, TinyDVAEConfig
 
 class TransformerAutoencoder(nn.Module):
-    def __init__(self, vocab_size, embed_dim, latent_dim, n_layers, n_heads, ffn_dim, context_window, cls_id, sos_id, n_latents=8, latent_dropout=0.03):
+    # def __init__(self, vocab_size, embed_dim, latent_dim, n_layers, n_heads, ffn_dim, context_window, cls_id, sos_id, n_latents=8, latent_dropout=0.03):
+    def __init__(self, config: TinyAutoencoderConfig):
         super().__init__()
-        self.encoder = TransformerEncoder(vocab_size, embed_dim, latent_dim, n_layers, n_heads, ffn_dim, context_window, cls_id)
-        self.decoder = TransformerDecoder(vocab_size, embed_dim, latent_dim, n_layers, n_heads, ffn_dim, context_window, sos_id, n_latents)
-        self.latent_dropout = nn.Dropout(latent_dropout)
+        self.config = config
+        self.encoder = TransformerEncoder(config.encoder_config)
+        self.decoder = TransformerDecoder(config.decoder_config)
+        self.latent_dropout = nn.Dropout(config.dropout_latent)
 
-        self.cls_id = cls_id
-        self.sos_id = sos_id
-        self.context_window = context_window
+        self.cls_id = config.cls_id
+        self.sos_id = config.sos_id
+        self.context_window = config.context_window
 
         # weight tying of embeddings and head
         self.decoder.embed.weight = self.encoder.embed.weight
@@ -294,3 +30,125 @@ class TransformerAutoencoder(nn.Module):
             return logits, latent, initial_embeddings, final_embeddings
         else:
             return logits, latent
+        
+class TransformerDVAE(nn.Module):
+    def __init__(self, config: TinyDVAEConfig):
+        super().__init__()
+        self.config = config
+        self.encoder = TinyLlamaTransformer(config.encoder_config)
+        self.encoder_ln = nn.LayerNorm(config.embed_dim)
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(config.latent_dim, config.decoder_ffn_dim),
+            nn.GELU(),
+            nn.Linear(config.decoder_ffn_dim, len(config.vocab))
+        )
+        self.decoder_ln = nn.LayerNorm(config.latent_dim) if config.decoder_ln else None
+
+        self.transition = nn.Sequential(
+            nn.Linear(config.latent_dim, config.transition_ffn_dim),
+            nn.GELU(),
+            nn.Linear(config.transition_ffn_dim, config.latent_dim * 2)
+        )
+        self.transition_ln = nn.LayerNorm(config.latent_dim) if config.transition_ln else None
+
+        self.latent_dropout = nn.Dropout(config.dropout_latent)
+
+        self.context_window = config.context_window
+        self.pooling = config.pooling
+
+        # additional layers to produce mean and logvar for VAE
+        self.to_mu = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
+        self.to_logvar = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def inference(self, x, return_internals=False):
+        "Run the inference model to get latent representation z, mean and logvar"
+        B, T = x.shape
+        if return_internals:
+            enc_out, initial_embeddings, final_embeddings = self.encoder(x, return_internals=return_internals, use_head=False)
+        else:
+            enc_out = self.encoder(x, return_internals=return_internals, use_head=False) # (B, T, E)
+        
+        if self.pooling == 'last':
+            latent_repr = enc_out[:, -1, :] # (B, E)
+        elif self.pooling == 'mean':
+            latent_repr = enc_out.mean(dim=1) # (B, E)
+        else:
+            raise ValueError(f"Unsupported pooling method: {self.pooling}")
+
+        # apply LayerNorm
+        latent_repr = self.encoder_ln(latent_repr) # (B, E)
+
+        mu = self.to_mu(latent_repr) # (B, latent_dim)
+        logvar = self.to_logvar(latent_repr) # (B, latent_dim)
+        z = self.reparameterize(mu, logvar) # (B, latent_dim)
+
+        if return_internals:
+            return z, mu, logvar, initial_embeddings, final_embeddings
+        else:
+            return z, mu, logvar
+
+    def transition_model(self, z):
+        "Predict the distribution of the next latent state given the current latent state"
+        # z is of shape (B, latent_dim)
+        if self.transition_ln:
+            z = self.transition_ln(z)
+        mu_logvar = self.transition(z) # (B, latent_dim * 2)
+        mu, logvar = mu_logvar.chunk(2, dim=-1) # each of shape (B, latent_dim)
+        return mu, logvar
+
+    def decode(self, z):
+        "Decode latent representation z to logits over vocabulary"
+        # z is of shape (B, latent_dim)
+        if self.decoder_ln:
+            z = self.decoder_ln(z)
+        logits = self.decoder(z) # (B, vocab_size)
+        return logits
+
+def kl_divergence_gaussians(mu_q, logvar_q, mu_p, logvar_p):
+    """
+    Computes the KL divergence between two multivariate Gaussians with diagonal covariances.
+    D_KL(q || p)
+    """
+    # input shapes: (B, latent_dim)
+    var_q = torch.exp(logvar_q)
+    var_p = torch.exp(logvar_p)
+
+    # Term 1: log(det(Sigma_p) / det(Sigma_q))
+    # For diagonal matrices, det(Sigma) = product of diagonal elements.
+    # log(det(Sigma)) = sum of log of diagonal elements.
+    # The diagonal of Sigma is the variance vector.
+    # So, log(det(Sigma)) = sum(log(var)) = sum(logvar).
+    term1 = torch.sum(logvar_p - logvar_q, dim=1)  # shape (B,)
+
+    # Term 2: tr(Sigma_p^-1 * Sigma_q)
+    # For diagonal matrices, this is the sum of (var_q / var_p).
+    term2 = torch.sum(var_q / var_p, dim=1)  # shape (B,)
+    
+    # Term 3: (mu_p - mu_q)^T * Sigma_p^-1 * (mu_p - mu_q)
+    # For diagonal matrices, this is the sum of ((mu_p - mu_q)^2 / var_p).
+    term3 = torch.sum(((mu_p - mu_q).pow(2)) / var_p, dim=1)  # shape (B,)
+    
+    # k is the latent dimension
+    k = mu_q.size(1)  # latent_dim 
+
+    # The KL divergence is 0.5 * (term1 - k + term2 + term3)
+    kld = 0.5 * (term1 - k + term2 + term3)  # shape (B,)
+
+    return kld
+
+# # --- In your training loop ---
+# # Get parameters from both models
+# mu_q, logvar_q = encoder(x_t, ...)
+# mu_p, logvar_p = transition_model(z_t_minus_1, ...)
+
+# # Compute the KL loss
+# KLD_loss = kl_divergence_gaussians(mu_q, logvar_q, mu_p, logvar_p)
+
+# # total_loss = reconstruction_loss + KLD_loss
+# # ... and so on
