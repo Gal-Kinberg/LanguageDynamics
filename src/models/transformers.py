@@ -174,7 +174,7 @@ class TinyLlamaTransformer(nn.Module):
         self.head.weight = self.embed.weight  # Optional head-embed weight tying
         self.context_window = config.context_window
 
-    def forward(self, x, return_internals=False):
+    def forward(self, x, return_internals=False, use_head=True):
         """
         Forward pass supporting token indices, probability distributions over tokens, or embedded vectors.
 
@@ -214,19 +214,27 @@ class TinyLlamaTransformer(nn.Module):
         else:
             raise ValueError(f"Unrecognized input shape: {x.shape}")
 
-        initial_embeddings = x.clone()
+        initial_embeddings = x.clone().detach()
 
         for layer in self.layers:
             x = layer(x)
 
-        x = self.ln_f(x)  #TODO: Replace final embeddings to be before the LayerNorm!
-        final_embeddings = x.clone()
-        logits = self.head(x)
+        if use_head:
+            x = self.ln_f(x)  #TODO: Replace final embeddings to be before the LayerNorm!
+            final_embeddings = x.clone().detach()
+            logits = self.head(x)
 
-        if return_internals:
-            return logits, initial_embeddings, final_embeddings
+            if return_internals:
+                return logits, initial_embeddings, final_embeddings
+            else:
+                return logits
+        
         else:
-            return logits
+            final_embeddings = x.clone().detach()
+            if return_internals:
+                return final_embeddings, initial_embeddings, final_embeddings
+            else:
+                return final_embeddings
 
 class TinyLlamaRawTransformer(nn.Module):
     # def __init__(self, embed_dim, n_layers, n_heads, ffn_dim, context_window):
