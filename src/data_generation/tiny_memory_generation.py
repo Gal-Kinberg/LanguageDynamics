@@ -317,11 +317,12 @@ def soft_generate(model, prompt_tokens, num_steps, device, token2id, id2token, m
 
     return input_embeddings, output_embeddings, distributions, generated_tokens
 
+#TODO: add option for batch input and tokenized input
 def generate_from_model(
     model: torch.nn.Module,
-    token2id,
-    id2token,
-    prompt: Optional[List[str]] = None,
+    prompt: Optional[List[str] | List[int]] = None,
+    token2id = None,
+    id2token = None,
     max_new_tokens: int = 32,
     temperature: float = 1.0,
     top_k: int = 1,
@@ -354,11 +355,19 @@ def generate_from_model(
     context_length = model.context_window
 
     # Convert sequence to tensor of token ids
-    input_ids = torch.tensor(
-        [token2id[token] for token in sequence],
-        dtype=torch.long,
-        device=device
-    ).unsqueeze(0)
+    if token2id:
+        input_ids = torch.tensor(
+            [token2id[token] for token in sequence],
+            dtype=torch.long,
+            device=device
+        )
+    else:
+        input_ids = torch.tensor(
+            prompt,
+            dtype=torch.long,
+            device=device
+        )
+    input_ids = input_ids.unsqueeze(0)  # add batch dimension
 
     # Initialize list to store probabilities
     all_probs = []
@@ -497,6 +506,50 @@ def plot_generation_probabilities(
 
     plt.tight_layout()
     return fig
+
+#TODO: add real batch generation support (need to make generate_from_model support batch input)
+def create_stacked_trajectories_array(initial_seqs: list[list[str]], context_window, token2id: dict, trajectories_per_initial_seq: int = 8, generation_batch_size: int = 1, stack=False, **kwargs):
+    """
+    Generates trajectories from initial sequences using the model.
+    
+    Args:
+        initial_seqs (list[list[int]]): List of initial sequences. Not tokenized.
+        model: The model to use for generation.
+        num_steps (int): Number of steps to generate.
+        context_window (int): Context window to use for the generation
+        device: Device to run the model on.
+        generation_batch_size (int): Size of each batch for generation.
+    
+    Returns:
+        list: List of generated trajectories.
+    """
+
+    # filter only sequences that are long enough
+    seqs_filtered = [seq[:context_window] for seq in initial_seqs if len(seq) >= context_window]
+    n_batches = len(seqs_filtered) // generation_batch_size
+
+    trajectories_list = []
+    for batch in tqdm(range(n_batches)):
+        x = seqs_filtered[(batch * generation_batch_size):((batch + 1) * generation_batch_size)][0]
+        for _ in range(trajectories_per_initial_seq):
+            generated_tokens, probs = generate_from_model(prompt=x, token2id=token2id, **kwargs)
+            trajectories_list.append(generated_tokens)
+
+    # encode the trajectories into a np.uint8 array
+    trajectories = np.zeros((len(trajectories_list), len(trajectories_list[0])), dtype=np.uint8)
+
+    for i, seq in enumerate(tqdm(trajectories_list)):
+        for j, token in enumerate(seq):
+            trajectories[i, j] = token2id[token]
+
+    # prepend BOS token to each trajectory
+    # trajectories = np.insert(trajectories, 0, bos_id, axis=1)  # Insert BOS token at the beginning of each trajectory
+
+    # Stack context windows
+    if stack:
+        trajectories = stack_context_windows_tokens(trajectories, context_window=context_window)  # [trajectories, time, context_window]
+
+    return trajectories
 
 
 # if __name__ == '__main__':
