@@ -119,6 +119,8 @@ class TinyDVAEConfig(TinyLMConfig):
     latent_dim: int = 3
     dropout_latent: float = 0.00
     encoder_config: TinyLMConfig | None = field(default=None, init=False)
+    dropout_decoder: float = 0.03
+    dropout_transition: float = 0.03
     decoder_ffn_dim: int = 128
     transition_ffn_dim: int = 128
     pooling: str = 'mean'  # 'mean' or 'last'
@@ -154,6 +156,12 @@ class TrainingKoopmanConfig(TrainingConfig):
     teacher_forcing: bool = False
 
 @dataclass
+class TrainingDVAEConfig(TrainingConfig):
+    reconstruction_coef: float = 1.0
+    kl_coef: float = 0.1
+    teacher_forcing: bool = True
+
+@dataclass
 class DataGenerationConfig(BaseConfig):
     max_depth: int = 4
     min_length: int = 4
@@ -170,6 +178,7 @@ class ExperimentConfig(BaseConfig):
     training_config: TrainingConfig = field(default_factory=TrainingConfig)
     data_generation_config: Optional[DataGenerationConfig] = field(default_factory=DataGenerationConfig)
     model_save_prefix: str | None = None
+    LM_checkpoint_path: str | None = None
 
     def __post_init__(self):
         self.device = f'cuda:{self.device_index}' if torch.cuda.is_available() else 'cpu'
