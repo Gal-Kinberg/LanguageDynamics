@@ -35,22 +35,39 @@ class TransformerDVAE(nn.Module):
     def __init__(self, config: TinyDVAEConfig):
         super().__init__()
         self.config = config
+        self.latent_dim = config.latent_dim
+        
+        # Encoder (inference) model
         self.encoder = TinyLlamaTransformer(config.encoder_config)
         self.encoder_ln = nn.LayerNorm(config.embed_dim)
         
+        # Decoder (emission) model
+        # self.dropout_decoder = nn.Dropout(config.dropout_decoder)
         self.decoder = nn.Sequential(
             nn.Linear(config.latent_dim, config.decoder_ffn_dim),
             nn.GELU(),
+            nn.Dropout(config.dropout_decoder),
             nn.Linear(config.decoder_ffn_dim, len(config.vocab))
         )
         self.decoder_ln = nn.LayerNorm(config.latent_dim) if config.decoder_ln else None
 
+        # Transition model
+        # self.dropout_transition = nn.Dropout(config.dropout_transition)
         self.transition = nn.Sequential(
             nn.Linear(config.latent_dim, config.transition_ffn_dim),
             nn.GELU(),
+            nn.Dropout(config.dropout_transition),
             nn.Linear(config.transition_ffn_dim, config.latent_dim * 2)
         )
         self.transition_ln = nn.LayerNorm(config.latent_dim) if config.transition_ln else None
+
+        self.transition_t0 = nn.Sequential(
+            nn.Linear(config.latent_dim, config.transition_ffn_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout_transition),
+            nn.Linear(config.transition_ffn_dim, config.latent_dim * 2)
+        )
+        self.transition_ln_t0 = nn.LayerNorm(config.latent_dim) if config.transition_ln else None
 
         self.latent_dropout = nn.Dropout(config.dropout_latent)
 
@@ -93,12 +110,17 @@ class TransformerDVAE(nn.Module):
         else:
             return z, mu, logvar
 
-    def transition_model(self, z):
+    def transition_model(self, z, is_t0=False):
         "Predict the distribution of the next latent state given the current latent state"
         # z is of shape (B, latent_dim)
-        if self.transition_ln:
-            z = self.transition_ln(z)
-        mu_logvar = self.transition(z) # (B, latent_dim * 2)
+        if is_t0:
+            if self.transition_ln_t0:
+                z = self.transition_ln_t0(z)
+            mu_logvar = self.transition_t0(z) # (B, latent_dim * 2)
+        else:
+            if self.transition_ln:
+                z = self.transition_ln(z)
+            mu_logvar = self.transition(z) # (B, latent_dim * 2)
         mu, logvar = mu_logvar.chunk(2, dim=-1) # each of shape (B, latent_dim)
         return mu, logvar
 
@@ -109,6 +131,41 @@ class TransformerDVAE(nn.Module):
             z = self.decoder_ln(z)
         logits = self.decoder(z) # (B, vocab_size)
         return logits
+
+#TODO: Complete LowRankTransition module
+# add the correct mean computation with the decay term and the activation in between
+# add the variance prediction
+# add time discretization factors?
+class LowRankTransition(nn.Module):
+    def __init__(self, latent_dim, rank, init_scale=0.01, decay=0.99):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.rank = rank
+        # TODO: add option for uniform, correlated gaussian initializations
+        self.A = nn.Parameter(torch.randn(latent_dim, rank) * init_scale)  # Low-rank factor A
+        self.B = nn.Parameter(torch.randn(rank, latent_dim) * init_scale)  # Low-rank factor B
+        self.bias = nn.Parameter(torch.zeros(latent_dim))  # Bias term
+        self.logvar = nn.Parameter(torch.ones(latent_dim))  # Diagonal covariance for Gaussian noise
+
+        self.decay_param = nn.Parameter(torch.log(-torch.log(torch.ones(1) * decay)))
+
+    @property
+    def decay(self):
+        return torch.exp(-torch.exp(self.decay_param))
+
+    def forward(self, z):
+        """
+        z: (B, latent_dim)
+        Returns:
+            next_mu: (B, latent_dim) - mean of the next latent state
+            next_logvar: (B, latent_dim) - log-variance of the next latent state
+        """
+        # Compute the low-rank transition
+        transition_matrix = torch.matmul(self.A, self.B)  # (latent_dim, latent_dim)
+        next_mu = torch.matmul(z, transition_matrix) + self.bias  # (B, latent_dim)
+        next_logvar = torch.clamp(2 * self.logvar, min=1e-6, max=100)
+
+        return next_mu, next_logvar
 
 def kl_divergence_gaussians(mu_q, logvar_q, mu_p, logvar_p):
     """
