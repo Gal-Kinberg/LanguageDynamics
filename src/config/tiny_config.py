@@ -123,7 +123,7 @@ class TinyDVAEConfig(TinyLMConfig):
     dropout_transition: float = 0.03
     decoder_ffn_dim: int = 128
     transition_ffn_dim: int = 128
-    pooling: str = 'mean'  # 'mean' or 'last'
+    pooling: str = 'last'  # 'mean' or 'last' or 'rope-mean'
     decoder_ln: bool = False
     transition_ln: bool = False
 
@@ -158,7 +158,7 @@ class TrainingKoopmanConfig(TrainingConfig):
 @dataclass
 class TrainingDVAEConfig(TrainingConfig):
     reconstruction_coef: float = 1.0
-    kl_coef: float = 0.1
+    warmup_steps: int = 10000
     teacher_forcing: bool = True
 
 @dataclass

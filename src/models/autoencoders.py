@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .attention import RoPEMultiheadAttention, MultiheadCrossAttention
+from .attention import RoPEMultiheadAttention, MultiheadCrossAttention, apply_rope
 from .transformers import TransformerBlock, TransformerDecoderBlock, TransformerEncoder, TransformerDecoder, TinyLlamaTransformer
 from config import TinyAutoencoderConfig, TinyKoopmanAutoencoderConfig, TinyDVAEConfig
 
@@ -95,6 +95,23 @@ class TransformerDVAE(nn.Module):
             latent_repr = enc_out[:, -1, :] # (B, E)
         elif self.pooling == 'mean':
             latent_repr = enc_out.mean(dim=1) # (B, E)
+        elif self.pooling == 'rope-mean':
+            B, T, E = enc_out.shape
+            # n_heads = self.config.encoder_config.n_heads
+            n_heads = 1  # use single head for RoPE
+            head_dim = E // n_heads
+            
+            # Reshape for RoPE: [B, T, E] -> [B, T, n_heads, head_dim]
+            enc_out_reshaped = enc_out.view(B, T, n_heads, head_dim)
+            
+            # Apply RoPE
+            enc_out_rope = apply_rope(enc_out_reshaped)
+            
+            # Reshape back: [B, T, n_heads, head_dim] -> [B, T, E]
+            enc_out_rope = enc_out_rope.view(B, T, E)
+            
+            # Average pooling
+            latent_repr = enc_out_rope.mean(dim=1) # (B, E)
         else:
             raise ValueError(f"Unsupported pooling method: {self.pooling}")
 
@@ -131,6 +148,30 @@ class TransformerDVAE(nn.Module):
             z = self.decoder_ln(z)
         logits = self.decoder(z) # (B, vocab_size)
         return logits
+
+    def generate_latent_trajectory(self, seq_len, device, z0 = None):
+        "Generate a sequence of latent states given an initial latent state z0"
+        self.eval()
+        with torch.no_grad():
+            if z0 is None:
+                mu, logvar = self.transition_model(torch.zeros(1, self.latent_dim, device=device), is_t0=True) # (1, latent_dim)
+                z0 = self.reparameterize(mu, logvar) # (1, latent_dim)
+            else:
+                # check if z0 has batch dimension, if not add it
+                if z0.dim() == 1:
+                    z0 = z0.unsqueeze(0) # (1, latent_dim)
+                z0 = z0.to(device)
+            B = z0.size(0)
+            z_t = z0
+            latent_trajectory = [z_t]
+            for t in range(1, seq_len):
+                mu_t, logvar_t = self.transition_model(z_t)
+                z_t = self.reparameterize(mu_t, logvar_t)
+                latent_trajectory.append(z_t)
+            latent_trajectory = torch.stack(latent_trajectory, dim=1) # (B, seq_len, latent_dim)
+            decoded_logits = self.decode(latent_trajectory.view(-1, self.latent_dim)) # (B * seq_len, vocab_size)
+            decoded_logits = decoded_logits.view(B, seq_len, -1) # (B, seq_len, vocab_size)
+        return latent_trajectory, decoded_logits
 
 #TODO: Complete LowRankTransition module
 # add the correct mean computation with the decay term and the activation in between
