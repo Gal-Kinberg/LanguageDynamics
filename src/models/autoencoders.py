@@ -94,13 +94,13 @@ class TransformerDVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
     
-    def inference(self, x, return_internals=False):
+    def inference(self, x, n_layers=None, return_internals=False):
         "Run the inference model to get latent representation z, mean and logvar"
         B, T = x.shape
         if return_internals:
-            enc_out, initial_embeddings, final_embeddings = self.encoder(x, return_internals=return_internals, use_head=False)
+            enc_out, initial_embeddings, final_embeddings = self.encoder(x, return_internals=return_internals, n_layers=n_layers, use_head=False)
         else:
-            enc_out = self.encoder(x, return_internals=return_internals, use_head=False) # (B, T, E)
+            enc_out = self.encoder(x, return_internals=return_internals, n_layers=n_layers, use_head=False) # (B, T, E)
         
         if self.pooling == 'last':
             latent_repr = enc_out[:, -1, :] # (B, E)
