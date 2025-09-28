@@ -159,6 +159,8 @@ class TrainingKoopmanConfig(TrainingConfig):
 class TrainingDVAEConfig(TrainingConfig):
     reconstruction_coef: float = 1.0
     warmup_steps: int = 10000
+    minimal_beta: float = 0.0
+    maximal_beta: float = 1.0
     teacher_forcing: bool = True
 
 @dataclass

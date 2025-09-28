@@ -39,7 +39,22 @@ class TransformerDVAE(nn.Module):
         
         # Encoder (inference) model
         self.encoder = TinyLlamaTransformer(config.encoder_config)
-        self.encoder_ln = nn.LayerNorm(config.embed_dim)
+        self.encoder_ln = nn.LayerNorm(config.embed_dim * config.context_window) if config.pooling == 'none' else nn.LayerNorm(config.embed_dim) 
+        # additional layers to produce mean and logvar for VAE
+        self.to_mu = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
+        # self.to_mu = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim)
+        # self.to_mu = nn.Sequential(
+        #     nn.Linear(config.encoder_config.embed_dim, config.encoder_config.ffn_dim),
+        #     nn.GELU(),
+        #     nn.Linear(config.encoder_config.ffn_dim, config.latent_dim)
+        # )
+        self.to_logvar = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
+        # self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim)
+        # self.to_logvar = nn.Sequential(
+        #     nn.Linear(config.encoder_config.embed_dim, config.encoder_config.ffn_dim),
+        #     nn.GELU(),
+        #     nn.Linear(config.encoder_config.ffn_dim, config.latent_dim)
+        # )
         
         # Decoder (emission) model
         # self.dropout_decoder = nn.Dropout(config.dropout_decoder)
@@ -73,10 +88,6 @@ class TransformerDVAE(nn.Module):
 
         self.context_window = config.context_window
         self.pooling = config.pooling
-
-        # additional layers to produce mean and logvar for VAE
-        self.to_mu = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
-        self.to_logvar = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -112,6 +123,8 @@ class TransformerDVAE(nn.Module):
             
             # Average pooling
             latent_repr = enc_out_rope.mean(dim=1) # (B, E)
+        elif self.pooling == 'none':
+            latent_repr = enc_out.reshape(B, -1) # (B, T * E)
         else:
             raise ValueError(f"Unsupported pooling method: {self.pooling}")
 
@@ -149,7 +162,7 @@ class TransformerDVAE(nn.Module):
         logits = self.decoder(z) # (B, vocab_size)
         return logits
 
-    def generate_latent_trajectory(self, seq_len, device, z0 = None):
+    def generate_latent_trajectory(self, seq_len, device, do_reparameterization = True, z0 = None):
         "Generate a sequence of latent states given an initial latent state z0"
         self.eval()
         with torch.no_grad():
@@ -166,7 +179,7 @@ class TransformerDVAE(nn.Module):
             latent_trajectory = [z_t]
             for t in range(1, seq_len):
                 mu_t, logvar_t = self.transition_model(z_t)
-                z_t = self.reparameterize(mu_t, logvar_t)
+                z_t = self.reparameterize(mu_t, logvar_t) if do_reparameterization else mu_t
                 latent_trajectory.append(z_t)
             latent_trajectory = torch.stack(latent_trajectory, dim=1) # (B, seq_len, latent_dim)
             decoded_logits = self.decode(latent_trajectory.view(-1, self.latent_dim)) # (B * seq_len, vocab_size)
