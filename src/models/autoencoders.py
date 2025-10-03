@@ -41,15 +41,15 @@ class TransformerDVAE(nn.Module):
         self.encoder = TinyLlamaTransformer(config.encoder_config)
         self.encoder_ln = nn.LayerNorm(config.embed_dim * config.context_window) if config.pooling == 'none' else nn.LayerNorm(config.embed_dim) 
         # additional layers to produce mean and logvar for VAE
-        self.to_mu = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
-        # self.to_mu = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim)
+        # self.to_mu = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
+        self.to_mu = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
         # self.to_mu = nn.Sequential(
         #     nn.Linear(config.encoder_config.embed_dim, config.encoder_config.ffn_dim),
         #     nn.GELU(),
         #     nn.Linear(config.encoder_config.ffn_dim, config.latent_dim)
         # )
-        self.to_logvar = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
-        # self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim)
+        # self.to_logvar = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
+        self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
         # self.to_logvar = nn.Sequential(
         #     nn.Linear(config.encoder_config.embed_dim, config.encoder_config.ffn_dim),
         #     nn.GELU(),

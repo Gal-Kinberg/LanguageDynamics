@@ -163,6 +163,9 @@ class TrainingDVAEConfig(TrainingConfig):
     maximal_beta: float = 1.0
     n_encoder_layers: int = 4
     teacher_forcing: bool = True
+    use_scheduler: bool = False
+    scheduler_T_max: int = 500
+    scheduler_eta_min: float = 1e-6
 
 @dataclass
 class DataGenerationConfig(BaseConfig):
