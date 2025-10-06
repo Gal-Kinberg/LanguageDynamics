@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 from .attention import RoPEMultiheadAttention, MultiheadCrossAttention, apply_rope
-from .transformers import TransformerBlock, TransformerDecoderBlock, TransformerEncoder, TransformerDecoder, TinyLlamaTransformer
+from .transformers import TransformerBlock, TransformerDecoderBlock, TransformerEncoder, TransformerDecoder, TinyLlamaTransformer, ResidualMLP
 from config import TinyAutoencoderConfig, TinyKoopmanAutoencoderConfig, TinyDVAEConfig
+from torch.distributions.multivariate_normal import MultivariateNormal
 
 class TransformerAutoencoder(nn.Module):
     # def __init__(self, vocab_size, embed_dim, latent_dim, n_layers, n_heads, ffn_dim, context_window, cls_id, sos_id, n_latents=8, latent_dropout=0.03):
@@ -49,7 +50,8 @@ class TransformerDVAE(nn.Module):
         #     nn.Linear(config.encoder_config.ffn_dim, config.latent_dim)
         # )
         # self.to_logvar = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
-        self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
+        # self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
+        self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim * (config.latent_dim + 1) // 2) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim * (config.latent_dim + 1) // 2)
         # self.to_logvar = nn.Sequential(
         #     nn.Linear(config.encoder_config.embed_dim, config.encoder_config.ffn_dim),
         #     nn.GELU(),
@@ -58,22 +60,27 @@ class TransformerDVAE(nn.Module):
         
         # Decoder (emission) model
         # self.dropout_decoder = nn.Dropout(config.dropout_decoder)
-        self.decoder = nn.Sequential(
-            nn.Linear(config.latent_dim, config.decoder_ffn_dim),
-            nn.GELU(),
-            nn.Dropout(config.dropout_decoder),
-            nn.Linear(config.decoder_ffn_dim, len(config.vocab))
-        )
+        # self.decoder = nn.Sequential(
+        #     nn.Linear(config.latent_dim, config.decoder_ffn_dim),
+        #     nn.GELU(),
+        #     nn.Dropout(config.dropout_decoder),
+        #     nn.Linear(config.decoder_ffn_dim, len(config.vocab))
+        # )
+        self.decoder = ResidualMLP(in_dim=config.latent_dim, hidden_dim=config.decoder_ffn_dim, out_dim=len(config.vocab), n_blocks=3)
         self.decoder_ln = nn.LayerNorm(config.latent_dim) if config.decoder_ln else None
 
         # Transition model
         # self.dropout_transition = nn.Dropout(config.dropout_transition)
-        self.transition = nn.Sequential(
-            nn.Linear(config.latent_dim, config.transition_ffn_dim),
-            nn.GELU(),
-            nn.Dropout(config.dropout_transition),
-            nn.Linear(config.transition_ffn_dim, config.latent_dim * 2)
-        )
+        # self.transition = nn.Sequential(
+        #     nn.Linear(config.latent_dim, config.transition_ffn_dim),
+        #     nn.GELU(),
+        #     nn.Dropout(config.dropout_transition),
+        #     nn.Linear(config.transition_ffn_dim, config.latent_dim * (1 + 1))
+        #     # nn.Linear(config.transition_ffn_dim, config.latent_dim + config.latent_dim * (config.latent_dim + 1) // 2)
+        # )
+        transition_out_dim = config.latent_dim + config.latent_dim * (config.latent_dim + 1) // 2
+        # transition_out_dim = config.latent_dim * (1 + 1)
+        self.transition = ResidualMLP(in_dim=config.latent_dim, hidden_dim=config.transition_ffn_dim, out_dim=transition_out_dim, n_blocks=3)
         self.transition_ln = nn.LayerNorm(config.latent_dim) if config.transition_ln else None
 
         self.transition_t0 = nn.Sequential(
@@ -132,8 +139,12 @@ class TransformerDVAE(nn.Module):
         latent_repr = self.encoder_ln(latent_repr) # (B, E)
 
         mu = self.to_mu(latent_repr) # (B, latent_dim)
-        logvar = self.to_logvar(latent_repr) # (B, latent_dim)
-        z = self.reparameterize(mu, logvar) # (B, latent_dim)
+        # logvar = self.to_logvar(latent_repr) # (B, latent_dim)
+        logvar = self.to_logvar(latent_repr) # (B, latent_dim*(latent_dim+1)/2)
+        L = self.build_cholesky_L(logvar)
+        dist_q = MultivariateNormal(loc=mu, scale_tril=L)
+        z = dist_q.rsample()
+        # z = self.reparameterize(mu, logvar) # (B, latent_dim)
 
         if return_internals:
             return z, mu, logvar, initial_embeddings, final_embeddings
@@ -150,8 +161,10 @@ class TransformerDVAE(nn.Module):
         else:
             if self.transition_ln:
                 z = self.transition_ln(z)
-            mu_logvar = self.transition(z) # (B, latent_dim * 2)
-        mu, logvar = mu_logvar.chunk(2, dim=-1) # each of shape (B, latent_dim)
+            # mu_logvar = self.transition(z) # (B, latent_dim * 2)
+            mu_logvar = self.transition(z) # (B, latent_dim + latent_dim*(latent_dim+1)/2)
+        # mu, logvar = mu_logvar.chunk(2, dim=-1) # each of shape (B, latent_dim)
+        mu, logvar = torch.split(mu_logvar, [self.latent_dim, self.latent_dim * (self.latent_dim + 1) // 2], dim=-1) # (B, latent_dim), (B, latent_dim*(latent_dim+1)/2)
         return mu, logvar
 
     def decode(self, z):
@@ -179,12 +192,25 @@ class TransformerDVAE(nn.Module):
             latent_trajectory = [z_t]
             for t in range(1, seq_len):
                 mu_t, logvar_t = self.transition_model(z_t)
-                z_t = self.reparameterize(mu_t, logvar_t) if do_reparameterization else mu_t
+                L_t = self.build_cholesky_L(logvar_t)
+                dist_t = MultivariateNormal(loc=mu_t, scale_tril=L_t)
+                z_t = dist_t.rsample()
+                # z_t = self.reparameterize(mu_t, logvar_t) if do_reparameterization else mu_t
                 latent_trajectory.append(z_t)
             latent_trajectory = torch.stack(latent_trajectory, dim=1) # (B, seq_len, latent_dim)
             decoded_logits = self.decode(latent_trajectory.view(-1, self.latent_dim)) # (B * seq_len, vocab_size)
             decoded_logits = decoded_logits.view(B, seq_len, -1) # (B, seq_len, vocab_size)
         return latent_trajectory, decoded_logits
+    
+    def build_cholesky_L(self, logvar):
+        var_p_log_diag = logvar[:, :self.latent_dim]
+        var_p_off_diag = logvar[:, self.latent_dim:]
+        positive_diag = torch.exp(var_p_log_diag)
+        L = torch.zeros(logvar.shape[0], self.latent_dim, self.latent_dim, device=logvar.device)
+        tril_indices = torch.tril_indices(row=self.latent_dim, col=self.latent_dim, offset=-1)
+        L[:, tril_indices[0], tril_indices[1]] = var_p_off_diag
+        L += torch.diag_embed(positive_diag)
+        return L
 
 #TODO: Complete LowRankTransition module
 # add the correct mean computation with the decay term and the activation in between

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .attention import RoPEMultiheadAttention, MultiheadCrossAttention
 from config import TinyEncoderConfig, TinyDecoderConfig, TinyLMConfig
 
@@ -293,3 +294,35 @@ class TinyLlamaRawTransformer(nn.Module):
             return x, initial_embeddings
         else:
             return x
+
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.lin1 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln1  = nn.LayerNorm(hidden_dim)
+        self.lin2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2  = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x):
+        h = self.lin1(x)
+        h = self.ln1(h)
+        h = F.gelu(h)
+        h = self.lin2(h)
+        h = self.ln2(h)
+        return F.gelu(h + x)  # pre-activation residual
+
+class ResidualMLP(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, n_blocks=2, dropout=0.0):
+        super().__init__()
+        self.input = nn.Linear(in_dim, hidden_dim)
+        self.blocks = nn.ModuleList([ResidualBlock(hidden_dim) for _ in range(n_blocks)])
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.head = nn.Linear(hidden_dim, out_dim)
+
+    def forward(self, x):
+        h = self.input(x)
+        h = F.gelu(h)
+        for b in self.blocks:
+            h = b(h)
+        h = self.dropout(h)
+        return self.head(h)
