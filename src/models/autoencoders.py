@@ -165,6 +165,9 @@ class TransformerDVAE(nn.Module):
             mu_logvar = self.transition(z) # (B, latent_dim + latent_dim*(latent_dim+1)/2)
         # mu, logvar = mu_logvar.chunk(2, dim=-1) # each of shape (B, latent_dim)
         mu, logvar = torch.split(mu_logvar, [self.latent_dim, self.latent_dim * (self.latent_dim + 1) // 2], dim=-1) # (B, latent_dim), (B, latent_dim*(latent_dim+1)/2)
+        L_t = self.build_cholesky_L(logvar)
+        dist_t = MultivariateNormal(loc=mu, scale_tril=L_t)
+        z = dist_t.rsample()
         return mu, logvar
 
     def decode(self, z):
