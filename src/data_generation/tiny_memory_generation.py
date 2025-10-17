@@ -551,6 +551,27 @@ def create_stacked_trajectories_array(initial_seqs: list[list[str]], context_win
 
     return trajectories
 
+def infer_memory_from_sequence(input_tokens: torch.Tensor, M_ids: List[int]):
+    """
+    Infers the memory state from a sequence of input tokens.
+
+    Args:
+        input_tokens (torch.Tensor): Tensor of shape [B, T] containing token IDs.
+        M_ids (List[int]): List of token IDs corresponding to memory tokens.
+    Returns:
+        torch.Tensor: Tensor of shape [B] containing inferred memory states.
+    """
+    B, T = input_tokens.shape
+    memory_states = torch.zeros(B, dtype=torch.long, device=input_tokens.device)
+
+    for b in range(B):
+        for t in range(T-1, -1, -1):  # iterate backwards
+            token_id = input_tokens[b, t].item()
+            if token_id in M_ids:
+                memory_states[b] = M_ids.index(token_id) + 1  # memory state is 1-indexed
+                break
+
+    return memory_states  # [B]
 
 # if __name__ == '__main__':
     # max_steps = float('inf')
