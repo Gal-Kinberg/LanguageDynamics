@@ -168,6 +168,10 @@ class TrainingDVAEConfig(TrainingConfig):
     scheduler_eta_min: float = 1e-6
 
 @dataclass
+class TrainingDAVBConfig(TrainingDVAEConfig):
+    gp_factor: int = 10
+
+@dataclass
 class DataGenerationConfig(BaseConfig):
     max_depth: int = 4
     min_length: int = 4
@@ -188,6 +192,11 @@ class ExperimentConfig(BaseConfig):
 
     def __post_init__(self):
         self.device = f'cuda:{self.device_index}' if torch.cuda.is_available() else 'cpu'
+
+@dataclass
+class ExperimentAVBConfig(ExperimentConfig):
+    critic_config: TinyModelConfig = field(default_factory=TinyModelConfig)
+    critic_steps: int = 5
 
 
 # CONFIG = {

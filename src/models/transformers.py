@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .attention import RoPEMultiheadAttention, MultiheadCrossAttention
 from config import TinyEncoderConfig, TinyDecoderConfig, TinyLMConfig
+from data_generation import infer_memory_from_sequence
 
 
 class TransformerBlock(nn.Module):
@@ -294,6 +295,21 @@ class TinyLlamaRawTransformer(nn.Module):
             return x, initial_embeddings
         else:
             return x
+        
+class TinyLlamaCritic(nn.Module):
+    def __init__(self, config: TinyLMConfig):
+        super().__init__()
+        self.config = config
+        self.transformer = TinyLlamaRawTransformer(config)
+        self.ln_f = nn.LayerNorm(config.embed_dim)
+        self.head = nn.Linear(config.embed_dim, len(config.vocab), bias=False)
+        self.context_window = config.context_window
+
+    def forward(self, x):
+        B, T, E = x.shape # [B, T, E]
+        x = self.transformer(x) # [B, T, E] transformed embeddings
+        logits = self.head(x) # [B, T, 1]
+        return logits
 
 class ResidualBlock(nn.Module):
     def __init__(self, hidden_dim):
@@ -326,3 +342,41 @@ class ResidualMLP(nn.Module):
             h = b(h)
         h = self.dropout(h)
         return self.head(h)
+
+class FixedEncoder(nn.Module):
+    def __init__(self, num_embeddings = 5, embed_dim = 2):
+        super().__init__()
+        initial_weights_matrix = torch.tensor([
+            [0, -2], # E1
+            [1.5, -0.8], # D1-1
+            [-1.5, -0.8], # D1-2
+            [0.8, 1.5], # M1
+            [-0.8, 1.5] # M2
+        ])
+        self.embed = nn.Embedding(num_embeddings, embed_dim)
+        self.embed.weight.data = initial_weights_matrix
+        # self.embed.requires_grad_ = False
+
+    def forward(self, x, M_list = [2, 3]):
+        # x is [B, T] token indices
+        B, T = x.shape
+        device = x.device
+        latent_dim = 2
+        latents = torch.zeros((B), device=device, dtype=torch.long)
+
+        memory_states = infer_memory_from_sequence(x, M_ids=M_list) # [B]
+        
+        for b in range(B):
+            if x[b, -1] == 0: # E token
+                latents[b] = 0
+            elif x[b, -1] == 2: # M1 token
+                latents[b] = 3
+            elif x[b, -1] == 3: # M2 token
+                latents[b] = 4
+            elif x[b, -1] == 1: # D token
+                if memory_states[b] == 1: # M1 state
+                    latents[b] = 1
+                elif memory_states[b] == 2: # M2 state
+                    latents[b] = 2
+
+        return self.embed(latents)

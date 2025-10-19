@@ -178,31 +178,37 @@ class TransformerDVAE(nn.Module):
         logits = self.decoder(z) # (B, vocab_size)
         return logits
 
+    
     def generate_latent_trajectory(self, seq_len, device, do_reparameterization = True, z0 = None):
+        "Generate a sequence of latent states given an initial latent state z0"
+        if z0 is None:
+            mu, logvar = self.transition_model(torch.zeros(1, self.latent_dim, device=device), is_t0=True) # (1, latent_dim)
+            z0 = self.reparameterize(mu, logvar) # (1, latent_dim)
+        else:
+            # check if z0 has batch dimension, if not add it
+            if z0.dim() == 1:
+                z0 = z0.unsqueeze(0) # (1, latent_dim)
+            z0 = z0.to(device)
+        B = z0.size(0)
+        z_t = z0
+        latent_trajectory = [z_t]
+        for t in range(1, seq_len):
+            mu_t, logvar_t = self.transition_model(z_t)
+            L_t = self.build_cholesky_L(logvar_t)
+            dist_t = MultivariateNormal(loc=mu_t, scale_tril=L_t)
+            z_t = dist_t.rsample()
+            # z_t = self.reparameterize(mu_t, logvar_t) if do_reparameterization else mu_t
+            latent_trajectory.append(z_t)
+        latent_trajectory = torch.stack(latent_trajectory, dim=1) # (B, seq_len, latent_dim)
+        return latent_trajectory
+
+    def generate_decode_latent_trajectory(self, seq_len, device, do_reparameterization = True, z0 = None):
         "Generate a sequence of latent states given an initial latent state z0"
         self.eval()
         with torch.no_grad():
-            if z0 is None:
-                mu, logvar = self.transition_model(torch.zeros(1, self.latent_dim, device=device), is_t0=True) # (1, latent_dim)
-                z0 = self.reparameterize(mu, logvar) # (1, latent_dim)
-            else:
-                # check if z0 has batch dimension, if not add it
-                if z0.dim() == 1:
-                    z0 = z0.unsqueeze(0) # (1, latent_dim)
-                z0 = z0.to(device)
-            B = z0.size(0)
-            z_t = z0
-            latent_trajectory = [z_t]
-            for t in range(1, seq_len):
-                mu_t, logvar_t = self.transition_model(z_t)
-                L_t = self.build_cholesky_L(logvar_t)
-                dist_t = MultivariateNormal(loc=mu_t, scale_tril=L_t)
-                z_t = dist_t.rsample()
-                # z_t = self.reparameterize(mu_t, logvar_t) if do_reparameterization else mu_t
-                latent_trajectory.append(z_t)
-            latent_trajectory = torch.stack(latent_trajectory, dim=1) # (B, seq_len, latent_dim)
+            latent_trajectory = self.generate_latent_trajectory(seq_len, device, do_reparameterization, z0) # (B, seq_len, latent_dim)
             decoded_logits = self.decode(latent_trajectory.view(-1, self.latent_dim)) # (B * seq_len, vocab_size)
-            decoded_logits = decoded_logits.view(B, seq_len, -1) # (B, seq_len, vocab_size)
+            decoded_logits = decoded_logits.view(latent_trajectory.shape[0], seq_len, -1) # (B, seq_len, vocab_size)
         return latent_trajectory, decoded_logits
     
     def build_cholesky_L(self, logvar):
