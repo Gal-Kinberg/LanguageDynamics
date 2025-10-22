@@ -380,7 +380,7 @@ class TransformerDVAEFixedEncoder(nn.Module):
         # z = self.reparameterize(mu, logvar) # (B, latent_dim)
 
         if return_internals:
-            return z, mu, logvar, initial_embeddings, final_embeddings
+            return z, mu, logvar
         else:
             return z, mu, logvar
 
