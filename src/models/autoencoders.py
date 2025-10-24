@@ -223,14 +223,53 @@ class TransformerDVAE(nn.Module):
             decoded_logits = decoded_logits.view(latent_trajectory.shape[0], seq_len, -1) # (B, seq_len, vocab_size)
         return latent_trajectory, decoded_logits
     
+    # def build_cholesky_L(self, logvar):
+    #     var_p_log_diag = logvar[:, :self.latent_dim]
+    #     var_p_off_diag = logvar[:, self.latent_dim:]
+    #     positive_diag = torch.exp(var_p_log_diag)
+    #     L = torch.zeros(logvar.shape[0], self.latent_dim, self.latent_dim, device=logvar.device)
+    #     tril_indices = torch.tril_indices(row=self.latent_dim, col=self.latent_dim, offset=-1)
+    #     L[:, tril_indices[0], tril_indices[1]] = var_p_off_diag
+    #     L += torch.diag_embed(positive_diag)
+    #     return L
+
+    # Cholesky factor construction with stability improvements
     def build_cholesky_L(self, logvar):
+        """Build lower triangular Cholesky factor L from log-variance parameters.
+        
+        Args:
+            logvar: Tensor of shape (batch_size, latent_dim + (latent_dim * (latent_dim-1))/2)
+                Contains log-diagonal elements followed by off-diagonal elements
+        
+        Returns:
+            L: Lower triangular Cholesky factor of shape (batch_size, latent_dim, latent_dim)
+        """
+        # Split logvar into diagonal and off-diagonal components
         var_p_log_diag = logvar[:, :self.latent_dim]
         var_p_off_diag = logvar[:, self.latent_dim:]
-        positive_diag = torch.exp(var_p_log_diag)
-        L = torch.zeros(logvar.shape[0], self.latent_dim, self.latent_dim, device=logvar.device)
+        
+        # Add small constant to diagonal for stability
+        eps = 1e-7
+        positive_diag = torch.exp(torch.clamp(var_p_log_diag, min=-20, max=20)) + eps
+        
+        # Initialize L with zeros
+        L = torch.zeros(
+            logvar.shape[0], 
+            self.latent_dim, 
+            self.latent_dim, 
+            dtype=logvar.dtype,
+            device=logvar.device
+        )
+        
+        # Scale off-diagonal elements to prevent exploding values
+        scale = 0.1
+        # scale = 1
         tril_indices = torch.tril_indices(row=self.latent_dim, col=self.latent_dim, offset=-1)
-        L[:, tril_indices[0], tril_indices[1]] = var_p_off_diag
-        L += torch.diag_embed(positive_diag)
+        L[:, tril_indices[0], tril_indices[1]] = var_p_off_diag * scale
+        
+        # Add diagonal elements
+        L = L + torch.diag_embed(positive_diag)
+        
         return L
 
 #TODO: Complete LowRankTransition module
