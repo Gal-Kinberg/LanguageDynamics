@@ -41,17 +41,29 @@ class TransformerDVAE(nn.Module):
         # Encoder (inference) model
         self.encoder = TinyLlamaTransformer(config.encoder_config)
         self.encoder_ln = nn.LayerNorm(config.embed_dim * config.context_window) if config.pooling == 'none' else nn.LayerNorm(config.embed_dim) 
+
         # additional layers to produce mean and logvar for VAE
+        mu_q_input_size = config.encoder_config.embed_dim * config.context_window if config.pooling == 'none' else config.encoder_config.embed_dim
+        mu_q_output_size = config.latent_dim
+        logvar_q_input_size = config.encoder_config.embed_dim * config.context_window if config.pooling == 'none' else config.encoder_config.embed_dim
+        # logvar_q_output_size = config.latent_dim # diagonal covariance
+        logvar_q_output_size = config.latent_dim * (config.latent_dim + 1) // 2 # non diagonal covariance
+
         # self.to_mu = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
-        self.to_mu = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
+        # self.to_mu = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
+        # self.to_mu = nn.Linear(mu_q_input_size, mu_q_output_size) # linear projection
+        self.to_mu = ResidualMLP(in_dim=mu_q_input_size, hidden_dim=config.encoder_config.ffn_dim, out_dim=mu_q_output_size, n_blocks=2)
         # self.to_mu = nn.Sequential(
         #     nn.Linear(config.encoder_config.embed_dim, config.encoder_config.ffn_dim),
         #     nn.GELU(),
         #     nn.Linear(config.encoder_config.ffn_dim, config.latent_dim)
         # )
+
         # self.to_logvar = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
         # self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
-        self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim * (config.latent_dim + 1) // 2) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim * (config.latent_dim + 1) // 2)
+        # self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim * (config.latent_dim + 1) // 2) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim * (config.latent_dim + 1) // 2)
+        # self.to_logvar = nn.Linear(logvar_q_input_size, logvar_q_output_size) # linear projection
+        self.to_logvar = ResidualMLP(in_dim=logvar_q_input_size, hidden_dim=config.encoder_config.ffn_dim, out_dim=logvar_q_output_size, n_blocks=2)
         # self.to_logvar = nn.Sequential(
         #     nn.Linear(config.encoder_config.embed_dim, config.encoder_config.ffn_dim),
         #     nn.GELU(),
