@@ -308,7 +308,9 @@ class TinyLlamaCritic(nn.Module):
     def forward(self, x):
         B, T, E = x.shape # [B, T, E]
         x = self.transformer(x) # [B, T, E] transformed embeddings
-        logits = self.head(x) # [B, T, 1]
+        x = x[:, -1, :] # take only the last token's embedding [B, E]
+        x = self.ln_f(x)
+        logits = self.head(x) # [B, 1]
         return logits
 
 class ResidualBlock(nn.Module):

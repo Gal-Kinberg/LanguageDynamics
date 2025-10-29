@@ -249,8 +249,8 @@ class TransformerDVAE(nn.Module):
         var_p_off_diag = logvar[:, self.latent_dim:]
         
         # Add small constant to diagonal for stability
-        eps = 1e-7
-        positive_diag = torch.exp(torch.clamp(var_p_log_diag, min=-20, max=20)) + eps
+        eps = 1e-6
+        positive_diag = torch.exp(0.5 * torch.clamp(var_p_log_diag, min=-20, max=20)) + eps
         
         # Initialize L with zeros
         L = torch.zeros(

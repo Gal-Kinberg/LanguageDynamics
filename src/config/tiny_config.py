@@ -169,6 +169,7 @@ class TrainingDVAEConfig(TrainingConfig):
 
 @dataclass
 class TrainingDAVBConfig(TrainingDVAEConfig):
+    lr_critic: float = 1e-4
     gp_factor: int = 10
 
 @dataclass
