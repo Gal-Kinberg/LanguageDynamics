@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 from .attention import RoPEMultiheadAttention, MultiheadCrossAttention, apply_rope
-from .transformers import TransformerBlock, TransformerDecoderBlock, TransformerEncoder, TransformerDecoder, TinyLlamaTransformer, ResidualMLP, FixedEncoder
-from config import TinyAutoencoderConfig, TinyKoopmanAutoencoderConfig, TinyDVAEConfig
+from .transformers import TransformerBlock, TransformerDecoderBlock, TransformerEncoder, TransformerDecoder, TinyLlamaTransformer, ResidualMLP, FixedEncoder, TinyLlamaRawTransformer
+from config import TinyAutoencoderConfig, TinyKoopmanAutoencoderConfig, TinyDVAEConfig, TinyLMConfig
 from torch.distributions.multivariate_normal import MultivariateNormal
 
 class TransformerAutoencoder(nn.Module):
@@ -51,8 +51,8 @@ class TransformerDVAE(nn.Module):
 
         # self.to_mu = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
         # self.to_mu = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
-        # self.to_mu = nn.Linear(mu_q_input_size, mu_q_output_size) # linear projection
-        self.to_mu = ResidualMLP(in_dim=mu_q_input_size, hidden_dim=config.encoder_config.ffn_dim, out_dim=mu_q_output_size, n_blocks=2)
+        self.to_mu = nn.Linear(mu_q_input_size, mu_q_output_size) # linear projection
+        # self.to_mu = ResidualMLP(in_dim=mu_q_input_size, hidden_dim=config.encoder_config.ffn_dim, out_dim=mu_q_output_size, n_blocks=2)
         # self.to_mu = nn.Sequential(
         #     nn.Linear(config.encoder_config.embed_dim, config.encoder_config.ffn_dim),
         #     nn.GELU(),
@@ -62,8 +62,8 @@ class TransformerDVAE(nn.Module):
         # self.to_logvar = nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
         # self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim)
         # self.to_logvar = nn.Linear(config.encoder_config.embed_dim * config.context_window, config.latent_dim * (config.latent_dim + 1) // 2) if config.pooling == 'none' else nn.Linear(config.encoder_config.embed_dim, config.latent_dim * (config.latent_dim + 1) // 2)
-        # self.to_logvar = nn.Linear(logvar_q_input_size, logvar_q_output_size) # linear projection
-        self.to_logvar = ResidualMLP(in_dim=logvar_q_input_size, hidden_dim=config.encoder_config.ffn_dim, out_dim=logvar_q_output_size, n_blocks=2)
+        self.to_logvar = nn.Linear(logvar_q_input_size, logvar_q_output_size) # linear projection
+        # self.to_logvar = ResidualMLP(in_dim=logvar_q_input_size, hidden_dim=config.encoder_config.ffn_dim, out_dim=logvar_q_output_size, n_blocks=2)
         # self.to_logvar = nn.Sequential(
         #     nn.Linear(config.encoder_config.embed_dim, config.encoder_config.ffn_dim),
         #     nn.GELU(),
@@ -105,6 +105,20 @@ class TransformerDVAE(nn.Module):
 
         self.latent_dropout = nn.Dropout(config.dropout_latent)
 
+        if config.pooling == 'attention':
+            self.attention_pooling = TinyLlamaRawTransformer(
+                TinyLMConfig(
+                    vocab=config.vocab,
+                    embed_dim=config.encoder_config.embed_dim,
+                    context_window=config.context_window,
+                    ffn_dim=config.encoder_config.ffn_dim,
+                    n_layers=2,
+                    n_heads=config.encoder_config.n_heads,
+                    dropout_residual=0.02,
+                    dropout_self_attention=0.03,
+                )
+            )
+
         self.context_window = config.context_window
         self.pooling = config.pooling
 
@@ -144,6 +158,8 @@ class TransformerDVAE(nn.Module):
             latent_repr = enc_out_rope.mean(dim=1) # (B, E)
         elif self.pooling == 'none':
             latent_repr = enc_out.reshape(B, -1) # (B, T * E)
+        elif self.pooling == 'attention':
+            latent_repr = self.attention_pooling(enc_out)[:, -1] # (B, E)
         else:
             raise ValueError(f"Unsupported pooling method: {self.pooling}")
 
