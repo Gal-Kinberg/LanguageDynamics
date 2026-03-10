@@ -216,28 +216,28 @@ class TinyLlamaTransformer(nn.Module):
         else:
             raise ValueError(f"Unrecognized input shape: {x.shape}")
 
-        initial_embeddings = x.clone().detach()
+        internal_embeddings = torch.zeros(B, self.config.n_layers+1, T, E, device=x.device)
+        internal_embeddings[:, 0] = x.clone().detach()
 
         if n_layers is None:
             n_layers = len(self.layers)
         
         for layer in range(n_layers):
             x = self.layers[layer](x)
+            internal_embeddings[:, layer+1] = x.clone().detach()
 
         if use_head:
             x = self.ln_f(x)  #TODO: Replace final embeddings to be before the LayerNorm!
-            final_embeddings = x.clone().detach()
             logits = self.head(x)
 
             if return_internals:
-                return logits, initial_embeddings, final_embeddings
+                return logits, internal_embeddings
             else:
                 return logits
         
         else:
-            final_embeddings = x.clone().detach()
             if return_internals:
-                return x, initial_embeddings, final_embeddings
+                return x, internal_embeddings
             else:
                 return x
 
@@ -332,12 +332,14 @@ class ResidualBlock(nn.Module):
 class ResidualMLP(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, n_blocks=2, dropout=0.0):
         super().__init__()
+        self.ln = nn.LayerNorm(in_dim)
         self.input = nn.Linear(in_dim, hidden_dim)
         self.blocks = nn.ModuleList([ResidualBlock(hidden_dim) for _ in range(n_blocks)])
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.head = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, x):
+        x = self.ln(x)
         h = self.input(x)
         h = F.gelu(h)
         for b in self.blocks:

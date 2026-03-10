@@ -143,6 +143,12 @@ class TinyDVAEConfig(TinyLMConfig):
         )
 
 @dataclass
+class TinyDVQVAEConfig(TinyDVAEConfig):
+    mode: str = field(default='DVQVAE', init=False)
+    codebook_size: int = 16
+    vq_beta: float = 0.25
+
+@dataclass
 class TrainingConfig(BaseConfig):
     lr: float = 2e-4
     batch_size: int = 128

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from .attention import RoPEMultiheadAttention, MultiheadCrossAttention, apply_rope
 from .transformers import TransformerBlock, TransformerDecoderBlock, TransformerEncoder, TransformerDecoder, TinyLlamaTransformer, ResidualMLP, FixedEncoder, TinyLlamaRawTransformer
-from config import TinyAutoencoderConfig, TinyKoopmanAutoencoderConfig, TinyDVAEConfig, TinyLMConfig
+from config import TinyAutoencoderConfig, TinyKoopmanAutoencoderConfig, TinyDVAEConfig, TinyLMConfig, TinyDVQVAEConfig
 from torch.distributions.multivariate_normal import MultivariateNormal
 
 class TransformerAutoencoder(nn.Module):
@@ -131,7 +131,7 @@ class TransformerDVAE(nn.Module):
         "Run the inference model to get latent representation z, mean and logvar"
         B, T = x.shape
         if return_internals:
-            enc_out, initial_embeddings, final_embeddings = self.encoder(x, return_internals=return_internals, n_layers=n_layers, use_head=False)
+            enc_out, internal_embeddings = self.encoder(x, return_internals=return_internals, n_layers=n_layers, use_head=False)
         else:
             enc_out = self.encoder(x, return_internals=return_internals, n_layers=n_layers, use_head=False) # (B, T, E)
         
@@ -175,7 +175,7 @@ class TransformerDVAE(nn.Module):
         # z = self.reparameterize(mu, logvar) # (B, latent_dim)
 
         if return_internals:
-            return z, mu, logvar, initial_embeddings, final_embeddings
+            return z, mu, logvar, internal_embeddings
         else:
             return z, mu, logvar
 
@@ -287,6 +287,292 @@ class TransformerDVAE(nn.Module):
         L = L + torch.diag_embed(positive_diag)
         
         return L
+
+class VectorQuantizer(nn.Module):
+    """Vector Quantizer module for VQ-VAE.
+    
+    Maps continuous encoder outputs to discrete codebook entries using nearest-neighbor lookup.
+    Uses straight-through estimator for gradient flow during backprop.
+    """
+    def __init__(self, codebook_size: int, codebook_dim: int, beta: float = 0.25):
+        """
+        Args:
+            codebook_size: Number of discrete codes in the codebook
+            codebook_dim: Dimension of each codebook entry
+            beta: Weight for commitment loss (controls how strongly encoder commits to codes)
+        """
+        super().__init__()
+        self.codebook_size = codebook_size
+        self.codebook_dim = codebook_dim
+        self.beta = beta
+        
+        # Initialize codebook with uniform distribution
+        self.codebook = nn.Embedding(codebook_size, codebook_dim)
+        self.codebook.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
+        
+        # Track codebook usage for monitoring
+        self.register_buffer("cluster_size", torch.zeros(codebook_size))
+        self.register_buffer("w_avg", self.codebook.weight.data.clone())
+    
+    def forward(self, z_cont: torch.Tensor) -> tuple:
+        """Quantize continuous latent representation to discrete codes.
+        
+        Args:
+            z_cont: Continuous latent codes of shape (B, latent_dim)
+        
+        Returns:
+            z_q: Quantized codes (same shape as input)
+            loss_vq: Vector quantization loss
+            perplexity: Codebook perplexity (measure of codebook usage)
+            indices: Indices of nearest codebook entries
+        """
+        # Flatten batch and compute L2 distances to all codebook entries
+        B = z_cont.shape[0]
+        # flat_z = z_cont.reshape(-1, self.codebook_dim)  # (B, D)
+        
+        # Compute distances: ||z - e||^2 = ||z||^2 + ||e||^2 - 2 * z^T * e
+        distances = (
+            torch.sum(z_cont ** 2, dim=1, keepdim=True)  # (B, 1)
+            + torch.sum(self.codebook.weight ** 2, dim=1)  # (K,)
+            - 2 * torch.matmul(z_cont, self.codebook.weight.t())  # (B, K)
+        )
+        
+        # Get indices of nearest codebook entries
+        indices = torch.argmin(distances, dim=1)  # (B,)
+        
+        # Quantize: replace continuous codes with nearest discrete codes
+        # z_q_flat = self.codebook(indices)  # (B, D)
+        # z_q = z_q_flat.reshape_as(z_cont)  # (B, latent_dim)
+        z_q = self.codebook(indices)  # (B, D)
+        
+        # VQ loss: commitment loss + codebook loss
+        loss_codebook = torch.mean((z_q.detach() - z_cont) ** 2)
+        loss_commit = self.beta * torch.mean((z_q - z_cont.detach()) ** 2)
+        loss_vq = loss_codebook + loss_commit
+        
+        # Straight-through estimator: copy gradients from z_q to z_cont
+        z_q = z_cont + (z_q - z_cont).detach()
+        
+        # Compute perplexity for monitoring codebook usage
+        with torch.no_grad():
+            encodings = torch.zeros(self.codebook_size, B, device=z_cont.device)
+            encodings.scatter_(0, indices.unsqueeze(0), 1)
+            avg_probs = torch.mean(encodings, dim=1)
+            perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        
+        return z_q, loss_vq, loss_codebook, loss_commit, perplexity, indices
+
+
+class TransformerDVQVAE(nn.Module):
+    """Transformer-based VQ-VAE for discrete latent variable modeling."""
+    
+    def __init__(self, config: TinyDVQVAEConfig):
+        super().__init__()
+        self.config = config
+        self.latent_dim = config.latent_dim
+        
+        # Encoder (inference) model
+        self.encoder = TinyLlamaTransformer(config.encoder_config)
+        self.encoder_ln = nn.LayerNorm(config.embed_dim * config.context_window) if config.pooling == 'none' else nn.LayerNorm(config.embed_dim)
+        
+        # Project encoder output to codebook dimension
+        encoder_out_size = config.encoder_config.embed_dim * config.context_window if config.pooling == 'none' else config.encoder_config.embed_dim
+        self.to_codebook = nn.Linear(encoder_out_size, config.latent_dim)
+        
+        # Vector Quantizer
+        # Use config.latent_dim as codebook_size (number of discrete codes)
+        # Adjust this based on how many discrete states you want
+        codebook_size = config.codebook_size
+        self.quantizer = VectorQuantizer(
+            codebook_size=codebook_size,
+            codebook_dim=config.latent_dim,
+            beta=config.vq_beta
+        )
+        
+        # Decoder (emission) model
+        self.decoder = ResidualMLP(
+            in_dim=config.latent_dim,
+            hidden_dim=config.decoder_ffn_dim,
+            out_dim=len(config.vocab),
+            n_blocks=3
+        )
+        self.decoder_ln = nn.LayerNorm(config.latent_dim) if config.decoder_ln else None
+        
+        # Transition model (for dynamics in latent space)
+        # transition_out_dim = config.latent_dim  # Predict next latent code
+        transition_out_dim = codebook_size  # Predict next discrete state
+        self.transition = ResidualMLP(
+            in_dim=config.latent_dim,
+            hidden_dim=config.transition_ffn_dim,
+            out_dim=transition_out_dim,
+            n_blocks=3
+        )
+        self.transition_ln = nn.LayerNorm(config.latent_dim) if config.transition_ln else None
+        
+        self.transition_t0 = nn.Sequential(
+            nn.Linear(config.latent_dim, config.transition_ffn_dim),
+            nn.GELU(),
+            nn.Dropout(config.dropout_transition),
+            nn.Linear(config.transition_ffn_dim, config.latent_dim)
+        )
+        self.transition_ln_t0 = nn.LayerNorm(config.latent_dim) if config.transition_ln else None
+        
+        self.latent_dropout = nn.Dropout(config.dropout_latent)
+        
+        if config.pooling == 'attention':
+            self.attention_pooling = TinyLlamaRawTransformer(
+                TinyLMConfig(
+                    vocab=config.vocab,
+                    embed_dim=config.encoder_config.embed_dim,
+                    context_window=config.context_window,
+                    ffn_dim=config.encoder_config.ffn_dim,
+                    n_layers=2,
+                    n_heads=config.encoder_config.n_heads,
+                    dropout_residual=0.02,
+                    dropout_self_attention=0.03,
+                )
+            )
+        
+        self.context_window = config.context_window
+        self.pooling = config.pooling
+    
+    def inference(self, x, n_layers=None, return_internals=False):
+        """Run inference to get discrete latent codes.
+        
+        Returns:
+            z_q: Quantized latent codes (B, latent_dim)
+            loss_vq: VQ loss
+            perplexity: Codebook perplexity
+            indices: Codebook indices (optional, for analysis)
+        """
+        B, T = x.shape
+        if return_internals:
+            enc_out, internal_embeddings = self.encoder(x, return_internals=return_internals, n_layers=n_layers, use_head=False)
+        else:
+            enc_out = self.encoder(x, return_internals=return_internals, n_layers=n_layers, use_head=False) # (B, T, E)
+        
+        # Apply pooling
+        if self.pooling == 'last':
+            latent_repr = enc_out[:, -1, :]  # (B, E)
+        elif self.pooling == 'mean':
+            latent_repr = enc_out.mean(dim=1)  # (B, E)
+        elif self.pooling == 'none':
+            latent_repr = enc_out.reshape(B, -1)  # (B, T * E)
+        elif self.pooling == 'attention':
+            latent_repr = self.attention_pooling(enc_out)[:, -1]  # (B, E)
+        else:
+            raise ValueError(f"Unsupported pooling method: {self.pooling}")
+        
+        # Apply layer norm
+        latent_repr = self.encoder_ln(latent_repr)  # (B, E)
+        
+        # Project to latent dimension
+        z_cont = self.to_codebook(latent_repr)  # (B, latent_dim)
+        
+        # Quantize
+        z_q, loss_vq, loss_codebook, loss_commit, perplexity, indices = self.quantizer(z_cont)
+        
+        if return_internals:
+            return z_q, loss_vq, loss_codebook, loss_commit, perplexity, indices, internal_embeddings
+        else:
+            return z_q, loss_vq, loss_codebook, loss_commit, perplexity, indices
+    
+    def transition_model(self, z, is_t0=False):
+        """Predict next latent code distribution given current latent code.
+        
+        For VQ-VAE, this predicts the next continuous representation.
+        In practice, you might want to predict logits over codebook entries.
+        """
+        if is_t0:
+            if self.transition_ln_t0:
+                z = self.transition_ln_t0(z)
+            z_next_logits = self.transition_t0(z)  # (B, latent_dim)
+        else:
+            if self.transition_ln:
+                z = self.transition_ln(z)
+            z_next_logits = self.transition(z)  # (B, latent_dim)
+        
+        return z_next_logits
+    
+    def decode(self, z):
+        """Decode latent codes to logits over vocabulary."""
+        if self.decoder_ln:
+            z = self.decoder_ln(z)
+        logits = self.decoder(z)  # (B, vocab_size)
+        return logits
+    
+    def generate_latent_trajectory(self, seq_len, device, temperature=1.0, z0=None):
+        """Generate a sequence of discrete latent codes by sampling from transition model logits.
+        
+        Args:
+            seq_len: Length of trajectory to generate
+            device: Device to generate on
+            temperature: Temperature for softmax sampling (lower = more deterministic)
+            z0: Optional initial latent code (B, latent_dim) or index (B,)
+        
+        Returns:
+            latent_trajectory: Tensor of shape (B, seq_len, latent_dim) - quantized codes in latent space
+            index_trajectory: Tensor of shape (B, seq_len) - indices into codebook
+            decoded_logits: Tensor of shape (B, seq_len, vocab_size) - decoded token logits
+        """
+        self.eval()
+        with torch.no_grad():
+            # Initialize z0
+            if z0 is None:
+                # Generate initial state from prior
+                z0_logits = self.transition_model(torch.zeros(1, self.latent_dim, device=device), is_t0=True)
+                z0_idx = torch.multinomial(torch.softmax(z0_logits / temperature, dim=-1), num_samples=1).squeeze(-1)  # (1,)
+                z0 = self.quantizer.codebook(z0_idx)  # (1, latent_dim)
+            else:
+                # If z0 is provided as index, look up in codebook
+                if z0.dtype == torch.long:
+                    z0_idx = z0 if z0.dim() > 0 else z0.unsqueeze(0)
+                    z0 = self.quantizer.codebook(z0_idx)
+                else:
+                    # If z0 is latent vector, find nearest codebook entry
+                    if z0.dim() == 1:
+                        z0 = z0.unsqueeze(0)
+                    z0 = z0.to(device)
+                    # Find nearest codebook indices
+                    distances = (
+                        torch.sum(z0 ** 2, dim=1, keepdim=True)
+                        + torch.sum(self.quantizer.codebook.weight ** 2, dim=1)
+                        - 2 * torch.matmul(z0, self.quantizer.codebook.weight.t())
+                    )
+                    z0_idx = torch.argmin(distances, dim=1)  # (B,)
+                    z0 = self.quantizer.codebook(z0_idx)
+            
+            B = z0.size(0)
+            z_t = z0
+            z_t_idx = z0_idx if isinstance(z0_idx, torch.Tensor) else torch.full((B,), z0_idx, device=device, dtype=torch.long)
+            
+            latent_trajectory = [z_t]
+            index_trajectory = [z_t_idx]
+            
+            # Generate trajectory by sampling from transition model
+            for t in range(1, seq_len):
+                # Get logits over next codebook entries
+                z_next_logits = self.transition_model(z_t, is_t0=False)  # (B, codebook_size)
+                
+                # Sample indices from categorical distribution with temperature
+                probs = torch.softmax(z_next_logits / temperature, dim=-1)  # (B, codebook_size)
+                z_t_idx = torch.multinomial(probs, num_samples=1).squeeze(-1)  # (B,)
+                
+                # Look up quantized codes
+                z_t = self.quantizer.codebook(z_t_idx)  # (B, latent_dim)
+                
+                latent_trajectory.append(z_t)
+                index_trajectory.append(z_t_idx)
+            
+            # Stack trajectories
+            latent_trajectory = torch.stack(latent_trajectory, dim=1)  # (B, seq_len, latent_dim)
+            index_trajectory = torch.stack(index_trajectory, dim=1)  # (B, seq_len)
+            
+            # Decode to vocabulary logits
+            decoded_logits = self.decode(latent_trajectory.view(-1, self.latent_dim))  # (B * seq_len, vocab_size)
+            decoded_logits = decoded_logits.view(B, seq_len, -1)  # (B, seq_len, vocab_size)
+        
+        return latent_trajectory, index_trajectory, decoded_logits
 
 #TODO: Complete LowRankTransition module
 # add the correct mean computation with the decay term and the activation in between
