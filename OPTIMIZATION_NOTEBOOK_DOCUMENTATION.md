@@ -3,7 +3,7 @@
 > A `CLAUDE.md`-style reference for **one specific research notebook**:
 > [`src/scripts/feedback_circuits_transformerlens_optimization_only.ipynb`](src/scripts/feedback_circuits_transformerlens_optimization_only.ipynb)
 >
-> 104 cells, ~330 KB of source. This file is the map you should read before editing or running any of it.
+> 108 cells, ~350 KB of source. This file is the map you should read before editing or running any of it.
 
 ---
 
@@ -65,10 +65,13 @@ attention logits as a function of relative distance `d`. These statistics feed t
   ├─ [100] DEFINITIONS: estimators, approximate passes, the benchmark harness
   ├─ [102] Example run: partition-function abstraction on a Wikipedia corpus
   └─ [103] Result inspection: error histograms, error-vs-position, worst-case dump
+[104–107] EXACT 1-LAYER / SINGLE-HEAD / POSITION-FREE PASS — the abstraction's zero point
+  ├─ [105] `ExactSemanticHeadForwardPass`
+  └─ [107] Example run + ablation table (measured JSD ≈ 1.6e-12)
 ```
 
 Note that cells 88–98 (wide optimization) are only sketched here; cells 99–103 are
-documented in full in §2.9 and §5.
+documented in full in §2.9 and §5, and cells 104–107 in §2.10.
 
 ### 1.2 Dependency tree — Pipeline C (K-gram / multi-layer, the current one)
 
@@ -165,7 +168,7 @@ prepare_intact_instruction_corpus(model, ...)     → [ensemble_size, seq_len]
 
 | Symbol | Shape | Meaning |
 |---|---|---|
-| `pi_vals` / `context_vals` | `[N]` | Probability mass, sums to 1 |
+| `pi_vals` / `context_vals` | `[N]` | Probability mass, sums to 1 (the **one** exception is `ExactSemanticHeadForwardPass(mass_in_L_ctx=False)`, which deliberately passes raw counts — §2.10.4) |
 | `pi_keys` / `context_keys` | `[N, S_init]` | Integer token IDs; each row is one K-gram |
 | `S_init` | scalar | `sum(K_list) - len(K_list) + 1` — the exact input length needed to produce **one** output token through all layers |
 | `P_active` | `[N_queries, d_vocab]` | Rows sum to 1 |
@@ -189,12 +192,19 @@ ApproximationQualityBenchmark(model, approximate_pass, ...)   [cell 100]  ← EN
         │   └── model(tokens[:position+1])[0, -1]
         │       └── apply_sampling_transform(logits, T, top_p)
         ├── approximate_pass.predict(tokens, position)           ← UNDER TEST
-        │   └── PartitionFunctionApproximateForwardPass          [cell 100]
-        │       ├── context_estimator.estimate(tokens[:position+1], model, S_init)
-        │       │   ├── UnigramContextEstimator  → pi_from_context    [cell 9]
-        │       │   └── KGramContextEstimator    → get_kgram_distribution_from_tokens  [cell 9]
-        │       ├── _build_query_keys(tokens, position)  → [1, S_init]
-        │       └── abstract_forward_pass(...)                   [cell 10]
+        │   ├── PartitionFunctionApproximateForwardPass          [cell 100]
+        │   │   ├── context_estimator.estimate(tokens[:position+1], model, S_init)
+        │   │   │   ├── UnigramContextEstimator  → pi_from_context    [cell 9]
+        │   │   │   └── KGramContextEstimator    → get_kgram_distribution_from_tokens  [cell 9]
+        │   │   ├── _build_query_keys(tokens, position)  → [1, S_init]
+        │   │   └── abstract_forward_pass(...)                   [cell 10]
+        │   └── ExactSemanticHeadForwardPass                     [cell 105]   ← §2.10
+        │       ├── __init__: sigma_table / W_E_unit / extract_bos_sink (W_pos zeroed)
+        │       ├── _far_field(context, query_keys) → far_counts [d_vocab], N_far
+        │       │     n_far[v] = total[v] − alive_local[v] − [v == bos_id]
+        │       ├── _zero_pos_embeddings()  /  _rescaled_embeddings(sigma_query)
+        │       └── abstract_forward_pass(..., L_ctx=[N_far+K+1], C_far=[1.0],
+        │                                  ln_avg_sigma=[sigma_{x_t}])  [cell 10]
         ├── jsd_dense(p_real, p_approx)      → JSD               [cell 9]
         └── pi_from_context(...)             → unigram control baseline
     ↓
@@ -679,6 +689,172 @@ and dumps the worst case — its query token and the top-10 of both distribution
 side, which is usually where you see *what* the abstraction got wrong rather than by how
 much.
 
+### 2.10 The *exact* 1-layer forward pass (cells 104–107)
+
+`ExactSemanticHeadForwardPass` (cell 105) is not another approximation — it is the
+**zero point of the error scale**. It drives the same `abstract_forward_pass` that every
+other pipeline in this notebook uses, but parameterized so that it reproduces the concrete
+model bit-for-bit. Measured on the benchmark: **JSD ≈ 1.6e-12 nats** (float32 round-off),
+against a context-unigram baseline of ≈ 0.59 and a frozen-σ variant of ≈ 4.9e-3.
+
+Its value to a future agent is diagnostic. If a benchmark run is bad, this cell tells you
+whether the fault is in `single_layer_forward` (it is not — under these assumptions the
+machinery is provably exact) or in how you parameterized it. It also converts every
+residual error in the *general* case into an attributable quantity: turn one assumption
+off at a time and watch the JSD climb.
+
+#### 2.10.1 Why exactness is possible
+
+Zero the positional embeddings of a 1-layer attention-only model and the pre-softmax score
+between query position `t` and key position `j` collapses to
+
+```
+s(x_t, x_j) = (LN(W_E[x_t])·W_Q + b_Q) · (LN(W_E[x_j])·W_K + b_K) / sqrt(d_head)
+```
+
+— a function of the two **token ids** only. Position has dropped out. Therefore
+
+```
+Z       = Σ_j exp(s(x_t, x_j))            = Σ_v  n_v · exp(s(x_t, v))
+attn_z  = Σ_j exp(s(x_t, x_j))·v_j  / Z   = Σ_v  n_v · exp(s(x_t, v))·v(v) / Z
+```
+
+where `n_v` is the number of times token `v` occurs in the context. The forward pass is an
+exact function of the context unigram **counts**. Note *counts*, not the normalized
+distribution: the total context length `T` genuinely matters, and carrying it is exactly
+what `L_ctx` is for.
+
+#### 2.10.2 Mapping that onto the 3-part partition function
+
+`Z = Σ_c M_global[c] + Σ_s M_local[s] + M_sink`. Exactness is the requirement that the
+three terms **partition the context exactly once** — every token position counted, none
+counted twice.
+
+| Term | What it covers, with `W_pos = 0` | What must be true |
+|---|---|---|
+| `M_sink` | exactly **one** BOS occurrence | free — with no positions `sink_k` *is* the BOS key, so `M_sink = exp(s(x_t, BOS))`. Requires `tokens[0] == bos_token_id` (the benchmark's `to_tokens(prepend_bos=True)` guarantees it) |
+| `M_local` | the last `S_init` positions, **minus** every PAD/BOS position (`valid_mask` deletes those) | `exp(pos_score) = exp(0) = 1`; the window mask with `S_out == 1` admits all `S_init` positions, so each alive local token is counted once with its exact score |
+| `M_global` | everything else — the far field | `L_global · π_c · C_far` must equal `n_far[c]` |
+
+The tuning that follows:
+
+```
+C_far  = 1.0                  # C_far is the mean exponentiated POSITIONAL mass of a far
+                              # token; with no positional embeddings that is exp(0).
+
+L_ctx  = N_far + K_i + 1      # because single_layer_forward uses L_global = L_ctx - K_i - 1.
+                              # The "-1" is the BOS/sink slot and the "-K_i" is the local
+                              # window, so this parameterization is already the natural one.
+                              # PER FORWARD PASS: it grows with the prompt. In the clean
+                              # case (one BOS at position 0, no PAD) it is simply
+                              # L_ctx = T = position + 1.
+
+pi_c   = n_far[c] / N_far     # the FAR-FIELD-ONLY unigram, where
+                              #   n_far[v] = total_count[v] - alive_local_count[v] - [v == bos_id]
+                              # Using the whole-context unigram (what UnigramContextEstimator
+                              # returns) double-counts the local window and the sink.
+
+K_i    # NOT a tuning knob for exactness. It only shuttles mass between M_local and
+       # M_global; K = 1 (query token alone in the window) and K = 8 give identical
+       # results, verified. K = 1 is cheapest. What must be tuned is the TRIPLE
+       # (K_i, pi, L_ctx) jointly, so that the partition stays exact.
+```
+
+The off-by-one that this accounting exists to prevent: if you leave `π` as the full context
+unigram and set `L_ctx = T`, the tokens in the local window contribute **twice** (once via
+`M_local`, once via their share of `M_global`) and BOS contributes twice (once via
+`M_sink`, once via `π`). That is a silent, smooth error — the distribution still
+normalizes, it is just wrong, and it grows as `K_i / T`.
+
+#### 2.10.3 The one thing tuning cannot fix: the frozen LayerNorm
+
+`single_layer_forward` linearizes LN with a single frozen scalar `ln_avg_sigma`
+(§2.3, "the freeze hack"), while the true LN divides by a per-token `σ_v`. On this model
+that alone costs **JSD ≈ 4.9e-3**, nine orders of magnitude above the ~1e-12 float32 floor
+the rest of the construction reaches. It is the dominant error term in the 1-layer regime —
+larger than everything the partition function does — and worth remembering when reading any
+general benchmark number.
+
+With no positional embeddings the layer-0 residual at position `j` is exactly `W_E[x_j]`,
+so `σ_v` is a pure function of the token and can be made exact **without editing
+`single_layer_forward`**: feed the model a rescaled embedding matrix.
+
+```
+W_E'[v] = W_E[v] · (s / σ_v)          with   ln_avg_sigma = s
+```
+
+Centering is linear and commutes with the per-row scalar, so
+`(W_E'[v] − mean) / s == (W_E[v] − mean) / σ_v ==` the true LN output, for every `v`.
+`σ_v` is precomputed once into `self.sigma_table` as
+`sqrt(mean((W_E[v] − mean)²) + ln1.eps)` — the exact denominator TransformerLens uses.
+
+The one place the **un**-normalized residual is still read is the residual-stream update
+`shrunken_resid = combined_sem_resid[:, -S_out:, :] + attn_out`, which for a 1-layer model
+only ever touches the **query** token. Choosing `s = σ_{x_t}` (the query token's own σ)
+makes `W_E'[x_t] == W_E[x_t]`, so that read is exact too. The *context* rows' residuals are
+left rescaled and therefore wrong — they are discarded after layer 0, which is precisely
+why **this trick is restricted to `n_layers == 1`** and the constructor refuses anything
+deeper.
+
+#### 2.10.4 Constructor arguments
+
+| Argument | Effect |
+|---|---|
+| `active_head` | the single head the abstraction models. The real side **must** ablate all the others |
+| `K` | `K_list[0]`, and also `S_init`. Any value is exact; 1 is cheapest |
+| `exact_layernorm` | `True` = the `W_E`-rescaling trick above. `False` = fall back to a scalar `ln_avg_sigma` (the mean of `sigma_table`), which is the ablation that isolates §2.10.3's 4.9e-3 |
+| `mass_in_L_ctx` | *Only* `L_global · π_c` matters, so there are two factorizations of the same product. `True`: `π` is a normalized distribution and `L_ctx = N_far + K + 1`. `False`: `π` carries the raw counts and `L_ctx = K + 2` so `L_global = 1`. Mathematically identical — both measured at 1.644e-12, so the round-trip `False` avoids is below the float32 floor here. It would matter in fp16/bf16. The cost of `False` is that `context_vals` sums to `N_far`, not 1, which breaks every downstream consumer that assumes a simplex vector. **Leave it `True`** |
+| `temperature`, `top_p` | keep at `1.0`; anything else measures the sampling transform (§5.5.2) |
+
+#### 2.10.5 Preconditions — all enforced in `__init__` / `predict`
+
+The class raises rather than silently degrading, because a "nearly exact" run is worse than
+no run: it looks like a successful measurement.
+
+- `model.cfg.n_layers == 1` (see §2.10.3) and no MLP (`attn_only`).
+- `blocks[0].ln1` has no learnable **beta** — `single_layer_forward` applies γ but never β.
+  The TransformerLens default `fold_ln=True` folds both into `W_{Q,K,V}` / `b_{Q,K,V}` and
+  leaves a `LayerNormPre`, which satisfies this. **Loading with `fold_ln=False` — which
+  §4.2 recommends for the K-gram pipeline — breaks exactness**, and the constructor says so.
+- `model.cfg.attn_scale == sqrt(d_head)`, since `single_layer_forward` hardcodes it.
+- `W_U` does not alias `W_E` (the rescaling would corrupt the unembedding).
+- `tokens[0] == bos_token_id`, and no negative far-field count (the accounting self-checks).
+- The **real** side of the benchmark must run with both hooks:
+  `zero_head_hook` on every head except `active_head`, and `remove_pos_embed_hook`.
+  This is not checkable from inside the class; cell 107 wires it correctly, copy from there.
+
+#### 2.10.6 How it patches global state
+
+`abstract_forward_pass` reads `model.W_pos` and `model.W_E` directly, not through hooks, so
+the class patches `.data` under two context managers (`_zero_pos_embeddings`,
+`_rescaled_embeddings`) with `try/finally` restores. Consequences:
+
+- `approx_hooks` must stay **empty** — the abstraction patches the weights itself.
+- It is not thread-safe and must not run concurrently with anything else touching the model
+  (relevant if you ever fold it into the multi-GPU lane of cells 88–92).
+- `_W_E_buffer` is a persistent `[d_vocab, d_model]` scratch tensor (~100 MB at
+  48k × 512 fp32) held for the lifetime of the object, alongside `W_E_unit` of the same
+  size. Budget ~200 MB of VRAM per instance; cell 107 builds four of them for the ablation
+  table, so delete them when done.
+
+#### 2.10.7 Reference numbers
+
+`attn-only-1l`, head 3, 9 positions ≥ 300 on a small synthetic corpus of repeated
+sentences. Cell 107 as written runs on cell 102's Wikipedia `corpus`, so the exact digits
+will differ — what should reproduce is the *separation* between the rows:
+
+```
+exact K=1                                   JSD = 1.644e-12   top1 = 1.000
+exact K=8                                   JSD = 1.598e-12   top1 = 1.000
+counts in pi (mass_in_L_ctx=False)          JSD = 1.644e-12   top1 = 1.000
+frozen sigma (exact_layernorm=False)        JSD = 4.919e-03   top1 = 1.000
+baseline: JSD(real, raw context unigram)          5.897e-01
+```
+
+Read these as: the partition-function machinery is exact; `K` is free; the two
+factorizations of `L_global · π` agree; and the frozen-σ linearization is the single
+largest modelling error in the 1-layer regime.
+
 ---
 
 ## 3. Goals & Use Cases
@@ -697,6 +873,7 @@ much.
 | DLA / knockout / QK-OV cells | Classic mechanistic-interpretability scratch work on the *concrete* model, used to pick `active_heads_list` and `K_list`. |
 | `ContextDistributionEstimator` | Turn a realized context into the macroscopic state `π` in the `[N_c, S_init]` sparse format. Pluggable: unigram, K-gram, windowed. |
 | `ApproximateForwardPass` | Predict `p(next token \| context)` *without* running the concrete model. Pluggable: the partition-function abstraction, or any future variant. |
+| `ExactSemanticHeadForwardPass` | **Calibrate** the benchmark: drive `abstract_forward_pass` so that it reproduces the concrete model exactly (1 layer, 1 head, no positions). The zero point every other JSD is read against. |
 | `ApproximationQualityBenchmark` | **Validate** the abstraction: JSD between the real and approximated next-token distributions over a text corpus, with running mean/std. This is the cell that tells you whether anything else in the notebook is trustworthy. |
 
 ### 3.2 Which method should I use?
@@ -738,6 +915,18 @@ beat the raw context histogram is not using the model. Do this *before* trusting
 fixed point, a QSD, or a PCCA+ macrostate, because every one of them is computed through
 `abstract_forward_pass`.
 
+**"My JSD is bad — is `single_layer_forward` wrong, or is my parameterization wrong?"**
+→ Cells 104–107 (§2.10). `ExactSemanticHeadForwardPass` drives the *same*
+`abstract_forward_pass` to a JSD of ~1e-12 on a 1-layer, single-head, position-free model.
+So the machinery is not the problem; `π`, `L_ctx`, `C_far`, `K_list`, `active_heads_list`
+or the frozen σ are. Reproduce the exact run first, then reintroduce your assumptions one
+at a time and watch where the JSD jumps — §5.4 is the table of what to change.
+
+**"How much does the frozen-LayerNorm hack actually cost me?"**
+→ `ExactSemanticHeadForwardPass(exact_layernorm=False)`. On `attn-only-1l` it is the
+difference between 1.6e-12 and 4.9e-3, i.e. it is the dominant error term in the 1-layer
+regime — larger than everything the partition function does. §2.10.3.
+
 **"Which context estimator should I use in the benchmark?"**
 → `UnigramContextEstimator` for `n_layers == 1`, where the lift to `[N_c, S_init]` is
 exact. `KGramContextEstimator` for anything deeper — the unigram lift degenerates there
@@ -759,7 +948,10 @@ Cell 81 then builds a pairwise JSD affinity matrix between the QSDs at different
 
 Cells 3 → 5 → 7 → 9 → 10 → 11 → 13 are pure definitions and must all run first.
 Cell **100** is a fourth definitions-only cell (the approximation benchmark) and depends on
-cells 9 and 10; it can be run at any point after them.
+cells 9 and 10; it can be run at any point after them. Cell **105** is a fifth
+(`ExactSemanticHeadForwardPass`, §2.10) and depends on 10 and 100. Cell 107 additionally
+needs `zero_head_hook` / `remove_pos_embed_hook` from cell 7 and a `corpus` — cell 102's
+will do.
 Cell 15 loads the model. Everything after that assumes `model`, `device`, and the
 definitions above are live. Beyond that the notebook is **not** linearly runnable —
 sections 50–58, 59–60, 61–66, 67–70, 71–82, 88–98, 99–103 are alternative experiments
@@ -792,10 +984,13 @@ commented-out `model_name` lines in cell 15 and the `### tinystories-1L` block i
 are the configurations these sections were actually developed against. Llama is the right
 choice only for the profiling sections (61–66) and `profile_deep_heads_*`.
 
-**⚠ `fold_ln=False` is mandatory.** `extract_frozen_sigma`, the LN linearization inside
-`single_layer_forward`, and the `ln1.w` access all assume LayerNorm weights are still
-present as separate modules. Loading with the default `fold_ln=True` silently changes the
-semantics.
+**⚠ `fold_ln=False` is mandatory — except for cells 104–107.** `extract_frozen_sigma`, the
+LN linearization inside `single_layer_forward`, and the `ln1.w` access all assume LayerNorm
+weights are still present as separate modules. Loading with the default `fold_ln=True`
+silently changes the semantics. The exception runs the other way: `single_layer_forward`
+applies γ but **never β**, so `ExactSemanticHeadForwardPass` (§2.10) requires the
+`fold_ln=True` model, where β has been folded into `b_{Q,K,V}`, and its constructor raises
+otherwise. The two lanes want different loads; reload the model when you switch.
 
 **⚠ `L_ctx_list` / `C_far_list` must be sliced to the ACTIVE heads.**
 `profile_thermodynamic_heads` returns one entry per head in the model;
@@ -1133,6 +1328,14 @@ def sliding_window_pass(model, base_kwargs, K_list, context_estimator):
 # and keep L_ctx > K_i + 1 or the global term goes negative.
 ```
 
+Worked example — **per-forward-pass `L_ctx` / `C_far` / `π`**. `ExactSemanticHeadForwardPass`
+(cell 105, §2.10) is the reference for this pattern: nothing says `forward_pass_kwargs` has
+to be constant across positions, and for anything whose horizon depends on the realized
+prompt length it must not be. It rebuilds `L_ctx_list`, `C_far_list`, `ln_avg_sigma_list`
+and the context measure inside `predict`, and patches `model.W_pos` / `model.W_E` around
+the call under `try/finally`. Copy its structure whenever the abstraction's parameters are
+a function of the prompt rather than of the model.
+
 A genuinely non-`abstract_forward_pass` baseline — useful as a sanity floor — is just as
 easy, because the ABC knows nothing about the K-gram machinery:
 
@@ -1180,6 +1383,12 @@ variant sees identical positions:
 | Is the state estimate the bottleneck, or the forward pass? | swap `UnigramContextEstimator` ↔ `KGramContextEstimator` at fixed `forward_pass_kwargs` |
 | Does the model actually need long context? | `TruncatedContextForwardPass` at several windows |
 | Are the chosen heads the ones carrying the behaviour? | sweep `active_heads_list` (remembering to slice `L_ctx`/`C_far` — §4.2) |
+| How much does the frozen-σ LayerNorm linearization cost? | `ExactSemanticHeadForwardPass(exact_layernorm=False)` vs. `True` (§2.10.3) |
+| Is any of the residual error the *machinery* rather than the parameters? | `ExactSemanticHeadForwardPass` — if it does not reach ~1e-12, your preconditions (§2.10.5) are violated, not your `π` |
+
+For a 1-layer, single-head, position-free model the error floor is **zero**, and
+`ExactSemanticHeadForwardPass` reaches it. Start every attribution study from that run and
+add assumptions back one at a time; each step's JSD increment is that assumption's cost.
 
 The commented-out sweep at the bottom of cell 103 is the template: rebind
 `benchmark.approximate_pass` and call `benchmark.run(corpus)` again.
@@ -1204,3 +1413,15 @@ The commented-out sweep at the bottom of cell 103 is the template: rebind
    (see the multi-layer unigram case in §2.9.4).
 6. **`model.cfg.use_attn_result = True`** (cell 15) multiplies attention activation memory
    by `n_heads` in the *real* forward pass. Turn it off before a long benchmark run.
+7. **An abstraction that patches model weights needs `approx_hooks = []`.**
+   `ExactSemanticHeadForwardPass` swaps `model.W_pos` and `model.W_E` in place because
+   `abstract_forward_pass` reads them directly rather than through hook points. Adding
+   `approx_hooks` on top layers a second, independent intervention on the same forward
+   pass; adding the *same* intervention twice (e.g. `remove_pos_embed_hook`) is harmless
+   but misleading in `config`. Always restore patched `.data` in a `finally` — an
+   exception mid-`predict` that leaks a rescaled `W_E` silently corrupts every later cell
+   in the kernel.
+8. **Exactness claims need `fold_ln=True`.** §4.2 tells you to load with `fold_ln=False`
+   for the K-gram pipeline; that leaves a learnable `ln1.b` which `single_layer_forward`
+   never applies, so the exact class refuses to run. The two lanes want different model
+   loads — reload the model between them rather than trusting one.
