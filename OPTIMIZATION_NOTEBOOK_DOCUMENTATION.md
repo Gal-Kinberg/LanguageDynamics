@@ -3,7 +3,8 @@
 > A `CLAUDE.md`-style reference for **one specific research notebook**:
 > [`src/scripts/feedback_circuits_transformerlens_optimization_only.ipynb`](src/scripts/feedback_circuits_transformerlens_optimization_only.ipynb)
 >
-> 108 cells, ~350 KB of source. This file is the map you should read before editing or running any of it.
+> 141 cells, ~660 KB of source. This file is the map you should read before editing or running any of it.
+> Cell numbers throughout refer to this revision.
 
 ---
 
@@ -60,18 +61,33 @@ attention logits as a function of relative distance `d`. These statistics feed t
 [71–78]  K-gram exploration → sub-stochastic matrix → MSM spectral + PCCA+ analysis
 [79–82]  Sweep the MSM pipeline along a generated trajectory; QSD affinity matrix
 [83–87]  Trajectory diagnostics: JSD loss at positional vs. non-positional fixed points
-[88–98]  Wide semantic head optimization — one head per GPU over a real corpus, + result inspection
-[99–103] APPROXIMATION QUALITY BENCHMARK — how close is the abstraction to the real model?
-  ├─ [100] DEFINITIONS: estimators, approximate passes, the benchmark harness
-  ├─ [102] Example run: partition-function abstraction on a Wikipedia corpus
-  └─ [103] Result inspection: error histograms, error-vs-position, worst-case dump
-[104–107] EXACT 1-LAYER / SINGLE-HEAD / POSITION-FREE PASS — the abstraction's zero point
-  ├─ [105] `ExactSemanticHeadForwardPass`
-  └─ [107] Example run + ablation table (measured JSD ≈ 1.6e-12)
+[88–106] Wide semantic head optimization — one head per GPU over a real corpus,
+         + result inspection, branching factors, Jacobian stability
+[107–111] APPROXIMATION QUALITY BENCHMARK — how close is the abstraction to the real model?
+  ├─ [108] DEFINITIONS (85 KB): estimators, approximate passes, the benchmark harness,
+  │        `DiscountedUnigramContextEstimator` and `MultiTimescaleMeanFieldForwardPass`
+  ├─ [110] Example run: partition-function abstraction on a Wikipedia corpus
+  └─ [111] Result inspection: error histograms, error-vs-position, worst-case dump
+[112–115] EXACT 1-LAYER / SINGLE-HEAD / POSITION-FREE PASS — the abstraction's zero point
+  ├─ [113] `ExactSemanticHeadForwardPass`
+  └─ [115] Example run + ablation table (measured JSD ≈ 1.6e-12)
+[116–121] EXACT SINGLE-SEMANTIC-HEAD FIXED-POINT SEARCH — the cell-68 loop driven by the
+          exact parameterization, with `MetastableKGramEngine` as the exploration phase
+[122–127] Jacobian / linear-stability analysis of a found fixed point
+[128–131] FULL MULTI-HEAD, POSITION-ENABLED ABSTRACTION  (§2.11–2.13)
+  ├─ [129] Timescale profiling: measure E_pos(d) per head, fit γ, build `mtmf_full`
+  └─ [131] Approximation quality + 10 feature ablations against the UNTOUCHED model
+[132–135] The same two cells on `tiny-stories-1L-21M` (16 heads, an MLP, attn_scale = 1)
+[136–140] WIDE MULTI-TIMESCALE MEAN-FIELD OPTIMIZATION  (§2.14, §6)
+  ├─ [137] The sweep: one explore-then-optimize fixed-point search per (text, position)
+  ├─ [138] Save `wide_mtmf_results` + its config to `results/wide_optimizations/*.pt`
+  └─ [140] Single-run diagnostics: 8-panel figure + the headline numbers
 ```
 
-Note that cells 88–98 (wide optimization) are only sketched here; cells 99–103 are
-documented in full in §2.9 and §5, and cells 104–107 in §2.10.
+Cell numbering is as of this revision of the notebook (141 cells). Cells 88–106 (the
+token-level wide optimization) are only sketched here; cells 107–111 are documented in
+full in §2.9 and §5, cells 112–115 in §2.10, cells 128–135 in §2.11–§2.13, and cells
+136–140 in §2.14 and §6.
 
 ### 1.2 Dependency tree — Pipeline C (K-gram / multi-layer, the current one)
 
@@ -179,11 +195,17 @@ prepare_intact_instruction_corpus(model, ...)     → [ensemble_size, seq_len]
 | sparse `P` | `[N+1, N+1]` COO | Row `N` is the absorbing sink |
 | `pi_vals`, `pi_keys` from a `ContextDistributionEstimator` | `[N_c]`, `[N_c, S_init]` | Same contract as `context_vals` / `context_keys` |
 | `p_real`, `p_approx` (benchmark) | `[d_vocab]` | Dense, sum to 1, after the shared sampling transform |
+| `context_vals` (MTMF) | `[N_c]` **or** `[H, N_c]` | Unigram mean field; **every row sums to 1**. `[N_c]` ties all heads (the optimization case), `[H, N_c]` is per head (the `predict` case) |
+| `context_keys` (MTMF) | `[N_c]` or `[N_c, 1]` | **Unigram token ids, not K-grams.** `forward` raises if you hand it `[N_c, K]` |
+| `query_keys` (MTMF) | `[N_q, K]` | The explicit fast windows; `S_init == K` for this class |
+| `far_mass` | `[H]` | `Z_far,h`, the effective far-token count. Travels *with* `context_vals`; only the product `far_mass[h] * context_vals[h, c]` enters the partition function |
+| `L_ctx`, `gamma` (MTMF) | `[H]` | Per **active** head, in `active_heads` order — slice the profiler output, do not index it by absolute head id |
+| `nu_vals`, `nu_keys` (MTMF state) | `[N]`, `[N, K]` | The tracked K-gram measure; its unigram marginal is the mean field |
 
 ### 1.7 Dependency tree — Pipeline D (approximation quality benchmark)
 
 ```
-ApproximationQualityBenchmark(model, approximate_pass, ...)   [cell 100]  ← ENTRY POINT
+ApproximationQualityBenchmark(model, approximate_pass, ...)   [cell 108]  ← ENTRY POINT
 └── run(corpus: List[str])
     ├── tokenize(text)                → [n_tokens]  (BOS-prepended, chopped to max_tokens)
     ├── sample_positions(n_tokens)    → List[int]   (seeded random.Random)
@@ -192,13 +214,13 @@ ApproximationQualityBenchmark(model, approximate_pass, ...)   [cell 100]  ← EN
         │   └── model(tokens[:position+1])[0, -1]
         │       └── apply_sampling_transform(logits, T, top_p)
         ├── approximate_pass.predict(tokens, position)           ← UNDER TEST
-        │   ├── PartitionFunctionApproximateForwardPass          [cell 100]
+        │   ├── PartitionFunctionApproximateForwardPass          [cell 108]
         │   │   ├── context_estimator.estimate(tokens[:position+1], model, S_init)
         │   │   │   ├── UnigramContextEstimator  → pi_from_context    [cell 9]
         │   │   │   └── KGramContextEstimator    → get_kgram_distribution_from_tokens  [cell 9]
         │   │   ├── _build_query_keys(tokens, position)  → [1, S_init]
         │   │   └── abstract_forward_pass(...)                   [cell 10]
-        │   └── ExactSemanticHeadForwardPass                     [cell 105]   ← §2.10
+        │   └── ExactSemanticHeadForwardPass                     [cell 113]   ← §2.10
         │       ├── __init__: sigma_table / W_E_unit / extract_bos_sink (W_pos zeroed)
         │       ├── _far_field(context, query_keys) → far_counts [d_vocab], N_far
         │       │     n_far[v] = total[v] − alive_local[v] − [v == bos_id]
@@ -212,7 +234,47 @@ ApproximationQualityBenchmark(model, approximate_pass, ...)   [cell 100]  ← EN
     ↓
     {"per_text": [...], "statistics": {...}, "skipped": [...], "config": {...}}
 
-summarize_benchmark(results)                                   [cell 100]  ← pretty printer
+summarize_benchmark(results)                                   [cell 108]  ← pretty printer
+```
+
+### 1.8 Dependency tree — Pipeline E (multi-timescale mean field, the full-model lane)
+
+```
+MultiTimescaleMeanFieldForwardPass(model, L_ctx, ...)      [cell 108]   ← ONE class, two roles
+│
+├── DIAGNOSTIC / SETUP  (cell 129)
+│   ├── positional_profile(query_token, d_max)      → E_pos(d) per head   [H, d_max+1]
+│   └── fit_gammas_from_profile(query_token, ...)   → γ per head          [H]
+│         └── L_ctx_h = 1 / (1 − γ_h)               ← read off the model, not guessed
+│
+├── THE OPERATOR
+│   └── forward(context_vals, context_keys, query_keys, far_mass, query_position)
+│       └── _forward_chunk(...)                     → P_active [N_q, d_vocab]
+│           ├── 1. FAST WINDOW  — real W_E + W_pos, real ln1, all 4 QK terms  (exact)
+│           ├── 2. BOS SINK     — extract_bos_sink, full (semantic+positional) query
+│           ├── 3. MEAN FIELD   — the only approximation
+│           │     ├── _pair_sigma_outer / frozen_sigma       ← LayerNorm for a far token
+│           │     ├── k_far, v_far from W_E[context_keys]
+│           │     ├── log_W_far = log E_pos(K) + log far_mass
+│           │     └── far_positional_value: + discount-weighted mean W_pos in the VALUE
+│           ├── 4. Z = ΣM_local + ΣM_far + M_sink, max-shifted
+│           └── 5. residual → MLP (if any) → ln_final → W_U → softmax/T → top-p (STE)
+│
+├── FIXED-POINT API  (cell 137)
+│   ├── kgram_to_unigram(vals, keys, marginal)      → the mean field, differentiably
+│   ├── power_iteration_step(...)                   → one ν → νP_π step on K-grams
+│   └── stationary(ν, keys, N, pruning_K, M, ...)   ← drop-in for compute_stationary_distribution
+│
+└── BENCHMARK API  (cells 131, 135)
+    └── predict(tokens, position)                   ← ApproximateForwardPass contract
+        └── DiscountedUnigramContextEstimator.estimate_per_head(...)  [cell 108]
+              → (context_vals [H, N_c], context_keys [N_c], far_mass [H])
+
+DiscountedUnigramContextEstimator                          [cell 108]
+├── estimate_per_head(tokens, model, K, gammas, dead_ids)  ← the per-head path
+└── estimate(tokens, model, S_init)                        ← ContextDistributionEstimator
+                                                             contract (single γ, lifts to
+                                                             [N_c, S_init], DROPS far_mass)
 ```
 
 ---
@@ -459,10 +521,10 @@ distributions whose supports genuinely differ — and it is *why* the optimizati
 discover new K-grams at all: a newly emitted key gets `1e-10` mass in `π` and real mass in
 `πP`, producing a large gradient that pulls `π` toward it.
 
-### 2.9 The approximation quality benchmark (cells 99–103)
+### 2.9 The approximation quality benchmark (cells 107–111)
 
 Everything else in this notebook *assumes* the abstraction (`abstract_forward_pass`) is a
-faithful stand-in for the concrete model. Cells 99–103 are the experiment that **measures
+faithful stand-in for the concrete model. Cells 107–111 are the experiment that **measures
 that assumption**. The question is deliberately narrow:
 
 > Given a real text and a position `t` inside it, how far is the abstraction's next-token
@@ -546,7 +608,7 @@ and you never learn why.
 **The RNG is seeded per run, not per text.** `random.Random(self.seed)` is created inside
 `run`, so two different approximations benchmarked with the same `seed`, `corpus`,
 `max_tokens`, `min_position` and `n_positions` see **identical positions**. This is what
-makes A/B comparisons meaningful; the commented-out sweep at the bottom of cell 103 relies
+makes A/B comparisons meaningful; the commented-out sweep at the bottom of cell 111 relies
 on it. Changing any of those five knobs changes the sampled positions.
 
 **`max_tokens` is clamped to `model.cfg.n_ctx`.** Feeding a longer prefix to the concrete
@@ -649,7 +711,7 @@ unsliced 8-entry `L_ctx` returns a perfectly normalized, perfectly wrong `[1, d_
 Cell 72's live TinyStories/attn-only config (`active_heads_list = [[3]]` with
 `L_ctx_list, C_far_list = profile_thermodynamic_heads(...)` unsliced) hits exactly this.
 **Any cell-72 / cell-80 result produced with a narrow `active_heads_list` and unsliced
-profiler output should be re-checked.** The fix is one line, and cell 102 shows it:
+profiler output should be re-checked.** The fix is one line, and cell 110 shows it:
 
 ```python
 L_ctx_list = [L_ctx_all[l][active_heads_list[l]] for l in range(model.cfg.n_layers)]
@@ -689,9 +751,9 @@ and dumps the worst case — its query token and the top-10 of both distribution
 side, which is usually where you see *what* the abstraction got wrong rather than by how
 much.
 
-### 2.10 The *exact* 1-layer forward pass (cells 104–107)
+### 2.10 The *exact* 1-layer forward pass (cells 112–115)
 
-`ExactSemanticHeadForwardPass` (cell 105) is not another approximation — it is the
+`ExactSemanticHeadForwardPass` (cell 113) is not another approximation — it is the
 **zero point of the error scale**. It drives the same `abstract_forward_pass` that every
 other pipeline in this notebook uses, but parameterized so that it reproduces the concrete
 model bit-for-bit. Measured on the benchmark: **JSD ≈ 1.6e-12 nats** (float32 round-off),
@@ -821,7 +883,7 @@ no run: it looks like a successful measurement.
 - `tokens[0] == bos_token_id`, and no negative far-field count (the accounting self-checks).
 - The **real** side of the benchmark must run with both hooks:
   `zero_head_hook` on every head except `active_head`, and `remove_pos_embed_hook`.
-  This is not checkable from inside the class; cell 107 wires it correctly, copy from there.
+  This is not checkable from inside the class; cell 115 wires it correctly, copy from there.
 
 #### 2.10.6 How it patches global state
 
@@ -834,13 +896,13 @@ the class patches `.data` under two context managers (`_zero_pos_embeddings`,
   (relevant if you ever fold it into the multi-GPU lane of cells 88–92).
 - `_W_E_buffer` is a persistent `[d_vocab, d_model]` scratch tensor (~100 MB at
   48k × 512 fp32) held for the lifetime of the object, alongside `W_E_unit` of the same
-  size. Budget ~200 MB of VRAM per instance; cell 107 builds four of them for the ablation
+  size. Budget ~200 MB of VRAM per instance; cell 115 builds four of them for the ablation
   table, so delete them when done.
 
 #### 2.10.7 Reference numbers
 
 `attn-only-1l`, head 3, 9 positions ≥ 300 on a small synthetic corpus of repeated
-sentences. Cell 107 as written runs on cell 102's Wikipedia `corpus`, so the exact digits
+sentences. Cell 115 as written runs on cell 110's Wikipedia `corpus`, so the exact digits
 will differ — what should reproduce is the *separation* between the rows:
 
 ```
@@ -854,6 +916,487 @@ baseline: JSD(real, raw context unigram)          5.897e-01
 Read these as: the partition-function machinery is exact; `K` is free; the two
 factorizations of `L_global · π` agree; and the frozen-σ linearization is the single
 largest modelling error in the 1-layer regime.
+
+---
+
+### 2.11 `MultiTimescaleMeanFieldForwardPass` — the full-model abstraction (cell 108)
+
+`ExactSemanticHeadForwardPass` (§2.10) buys its exactness by deleting everything that
+makes the model hard: the positional embeddings, seven of the eight heads, and any
+dependence on *where* in the context a token sits. `MultiTimescaleMeanFieldForwardPass`
+(MTMF) is the first class in the notebook that approximates the concrete model **as it
+actually is** — every head alive, positional embeddings on, MLP applied if there is one,
+and **no hooks on the real side** when it is benchmarked.
+
+It is also the notebook's **single source of truth** for the physics. The same object is
+
+* the `ApproximateForwardPass` the benchmark scores (`predict`), **and**
+* the operator the fixed-point optimization iterates (`forward`, `power_iteration_step`,
+  `stationary`).
+
+There is no second copy to keep in sync — which is the specific failure mode §2.4 and §4.3
+document for the older `single_layer_forward` lane, where the exploration engine and the
+gradient loop could silently drift apart.
+
+#### 2.11.1 The model: three blocks, one partition function
+
+For a query token `x_t` at a (dummy) absolute position `t*`, head `h` resolves its context
+in three blocks:
+
+```
+Z_h = Σ_{d=0}^{K-1} E_h(x_{t-d}, t*-d)                              ← FAST WINDOW  (exact)
+    + W_far_h · Σ_c π_h(c) · exp(q_h · k_s_h(c) / scale)            ← MEAN FIELD   (the only approximation)
+    + exp(q_h · k_BOS_h / scale)                                    ← BOS SINK     (exact)
+```
+
+and the head output is the same three sums taken against the values, divided by `Z_h`.
+
+* **The fast window** is computed with no approximation whatsoever: real token embeddings,
+  real absolute positional embeddings, the real `ln1` module, and **all four QK cross
+  terms** (`q_s·k_s`, `q_s·k_p`, `q_p·k_s`, `q_p·k_p`). The positional attention profile
+  *inside* the window is therefore **generated by the model**, not imposed — there are no
+  exponential weights here at all. This is the single biggest difference from
+  `single_layer_forward`, whose `M_local` multiplies a factorized `exp(q_s·k_s)·exp(q_p·k_p)`
+  and drops the two cross terms. (`local_cross_terms=False` reproduces the old behaviour
+  as an ablation.)
+* **The mean field** covers everything older than the window. Under a linearized LayerNorm
+  `k(x, j) = k_s(x) + k_p(j)`, so `exp(q·k(x_j, j)) = exp(q·k_s(x_j)) · exp(q·k_p(j))`
+  *exactly*. The approximation is the next step: the two factors are assumed
+  **independent across the far field**, so the sum over far positions factors into
+  (sum of positional weights) × (π-average of semantic weights). That is the *whole*
+  approximation in the attention block.
+* **The BOS sink** uses the true key and value of BOS at position 0 (`extract_bos_sink`),
+  and scores it with the **full** query — semantics *and* position — because attention to
+  the sink is strongly position-dependent.
+
+#### 2.11.2 Per-head timescales: one number fixes everything
+
+Each head carries its own effective context length `L_ctx[h]`, the total number of tokens
+it integrates, **fast window included**. Everything else is derived:
+
+```
+γ_h     = 1 − 1 / L_ctx[h]                       geometric profile with mean horizon L_ctx
+Z_far_h = Σ_{d≥K} γ_h^(d−K) = 1 / (1 − γ_h)      the effective far-token count
+W_far_h = E_pos_h(K) · Z_far_h                   the mean-field block's total weight
+```
+
+`E_pos_h(K) = exp(q_h · k_p_h(t*−K) / scale)` is the **real** positional attention factor
+at the first position outside the window. This is the load-bearing detail: the geometric
+tail is **anchored to the explicit window by continuity at its edge** (`d = K`), so the
+mean field picks up exactly where the exact block stops. If the true profile really is
+geometric with ratio `γ_h`, the three blocks together integrate exactly `L_ctx[h]` tokens'
+worth of attention mass — no double counting, no gap.
+
+Consistently, `π_h` is the discounted far-field law **anchored at `d = K`** (the nearest
+far token has weight `γ^0 = 1`); the `γ^K` separating it from the query lives in
+`E_pos_h(K)`, not in `π_h`. The pair `(π_h, Z_far_h)` is the exact analogue of the
+`(π, L_ctx)` split of `ExactSemanticHeadForwardPass(mass_in_L_ctx=True)`: only the
+**product** `Z_far_h · π_h(c)` — the effective discounted *count* of token `c` in head
+`h`'s far field — ever enters the partition function. **A truncated, unnormalized `π`
+therefore silently shortens the context**, exactly as in §2.10.4.
+
+#### 2.11.3 LayerNorm: pairwise σ, not a frozen scalar
+
+`LN(e_v + p_j) = w · (e_v − μ + p_j − μ) / σ(v, j) + b`. Centering is linear, so the split
+into a semantic and a positional stream is **exact provided both streams are divided by
+the same joint σ(v, j)**. The class never uses one global frozen σ:
+
+| Stream | σ used |
+|---|---|
+| fast window + query | the true `σ(token, position)` — in fact these rows go through the real `ln1` module, so they are exact |
+| far-field semantic keys/values | `σ(c, j_ref_h)`, where `j_ref_h = t* − (K + γ_h/(1−γ_h))` is the **discount-weighted mean far position** |
+| far positional stream (one vector per head) | a single per-head scalar: the `π_h`-average of `σ(c, j_ref_h)` |
+
+`_pair_sigma_outer` computes `σ(c, j)` in closed form from `‖ê_c‖²`, `‖p̂_j‖²` and their
+inner product, so it costs one matvec rather than an `[H, N_c, d_model]` tensor.
+
+Two details worth not "fixing":
+
+* The π-average that produces `sigma_pos` uses `context_vals.detach()`. π only picks
+  *which* far tokens the σ average runs over; that is a device for summarizing the
+  positional stream, not part of the operator, and detaching keeps the gradient w.r.t. π
+  inside the mean-field weights alone.
+* `layernorm_mode="frozen"` falls back to the notebook's original single scalar. It exists
+  to **price** the pairwise treatment, not as a supported production setting — §2.10.3
+  shows the frozen hack is the dominant error term in the exact lane.
+
+#### 2.11.4 Numerical stability: the max shift
+
+`log_W_far` carries `log(far_mass)`, which for `L_ctx ≈ 800` is `+6.7` on top of a raw QK
+logit. The original `single_layer_forward` exponentiates raw scores and **will** overflow
+here. `_forward_chunk` subtracts a per-`(head, query)` maximum from every exponent before
+`exp()`:
+
+```python
+shift = max(local_logits.max(-1), far_exponent.max(-1), sink_logits).detach()
+```
+
+`Z` and the output numerator are both homogeneous of degree 1 in the masses, so the ratio
+is untouched. The `.detach()` matters: the shift is a numerical device, and letting a
+gradient flow through an `argmax`-selected element would add a spurious term.
+
+#### 2.11.5 `attn_scale` is read off the module, not assumed
+
+```python
+self.scale = self._resolve_attn_scale(model, 0)
+```
+
+preference order: `model.blocks[0].attn.attn_scale` (already resolved and always correct),
+then `cfg.attn_scale` if it is a real value, then `sqrt(d_head)`. **GPT-Neo-derived models
+(`tiny-stories-*`) use `attn_scale = 1.0` and carry the scaling in the weights, and
+`cfg.attn_scale` is `−1.0` there (a sentinel).** `single_layer_forward` hardcodes
+`sqrt(d_head)` and is therefore *silently wrong* on those models; MTMF is not. This is one
+of the reasons it is the source of truth, and it is why the TinyStories lane (§2.13.2) is a
+real test rather than a rerun.
+
+#### 2.11.6 State, and what "π" means at a fixed point
+
+The tracked macroscopic state is a sparse measure over **K-grams** (the queries); the mean
+field is its **unigram marginal**, because a far-field position is only ever read through
+its token identity. `kgram_to_unigram` does that projection differentiably
+(`torch.unique` + `scatter_add`), so a gradient on the K-gram measure flows through the
+mean field too.
+
+> **At a mean-field fixed point every head's `π_h` is the same distribution.**
+> A discounted average of a stationary process has the same expectation for every `γ` —
+> the timescale changes the *variance* of a realized estimate, not its mean. Per-head
+> states differ only when the context is a concrete, finite prompt, which is exactly the
+> benchmark (`predict`) case.
+
+Hence `forward` accepts `context_vals` as either `[N_c]` (tied — the optimization case) or
+`[n_heads, N_c]` (per head — the prediction case), and the per-head timescales still act on
+the optimization through `W_far_h` alone. This is why §2.14's wide optimization uses a
+**unified** π and is not thereby cutting a corner.
+
+#### 2.11.7 Constructor arguments
+
+| Argument | Default | What it does |
+|---|---|---|
+| `model` | — | `HookedTransformer`, **`n_layers == 1`** (enforced: a unigram mean field is only a sufficient state for one layer; a second layer would read the far field's own neighbourhood). An MLP is allowed and is applied. |
+| `L_ctx` | — | Effective context length **per active head**, window included. float, list or `[n_heads]` tensor. Must exceed `K + 1` for every head. |
+| `active_heads` | `None` = all | Heads the abstraction models. The real model must ablate the rest for a like-for-like benchmark. |
+| `K` | `1` | Fast window width; also `S_init`, also the width of a query key. |
+| `gamma` | derived | Override `1 − 1/L_ctx`. `gamma == 1.0` means "no decay", and then `far_mass` must be supplied explicitly (`1/(1−γ)` diverges). |
+| `query_position_offset` | `n_ctx − 1` | The dummy absolute position `t*`. Everything positional is measured relative to it. Must satisfy `K ≤ t* < n_ctx`. |
+| `use_real_query_position` | `False` | `predict` uses the prompt's true position instead of `t*`. Off by default so `predict` and the optimization loop run the *same* operator. |
+| `local_cross_terms` | `True` | Keep all four QK terms inside the window. `False` reproduces the old factorized local block. |
+| `far_positional_value` | `True` | Add the discount-weighted mean positional embedding to the far-field **value**. The value is linear in the residual, so this is free and strictly more faithful. |
+| `layernorm_mode` | `"pairwise"` | `"frozen"` = one scalar σ for the far field (§2.11.3). |
+| `frozen_sigma` | RMS of a typical embedding | The scalar for `layernorm_mode="frozen"`. |
+| `mask_dead_local` | `True` | Wipe BOS/PAD positions out of the fast window so the sink is not double-counted. |
+| `ablate_sink` | `False` | Drop the BOS sink entirely — no key mass in `Z`, no value in the output. The JSD gap to `full` is how much of the forward pass the sink carries. |
+| `query_chunk_size` | `None` | Split the query batch when forming the `[H, N_q, N_c]` score tensor. `None` = one shot. |
+| `temperature`, `top_p` | `1.0`, `1.0` | Sampling transform on the returned probabilities, with the same straight-through estimator as §2.1. |
+| `context_estimator` | `DiscountedUnigramContextEstimator(window=K)` | Used by `predict` only. |
+
+#### 2.11.8 The verified limit — the acceptance test to re-run after any edit
+
+Zero `W_pos`, set `gamma = 1.0`, `active_heads = [h]`, `K = 1`, and pass the realized
+`far_mass` — i.e. drive MTMF into the regime of `ExactSemanticHeadForwardPass` — and it
+reproduces the concrete model (other heads ablated) to
+
+```
+JSD = 1.3e-12 nats on attn-only-1l, K-invariant across K = 1, 2, 8
+```
+
+That is float32 round-off, and it is the evidence that the three blocks **partition the
+context exactly once**: window + far field + sink, no token counted twice and none
+dropped. K-invariance is the sharp part of the test — it says mass moved between
+`M_local` and `M_far` without changing the answer.
+
+⚠ **No cell in the notebook currently reproduces this.** The number lives in the class's
+own block comment; the nearest live acceptance test, cell 118, checks the *batched path of
+`ExactSemanticHeadForwardPass`*, not MTMF. If you edit `_forward_chunk`, reconstruct the
+limit by hand — zero `W_pos`, one head, `gamma=1.0`, `K=1`, realized `far_mass`, compare
+against the concrete model with the other heads ablated — before trusting anything
+downstream. Adding that as a permanent cell would be a cheap, high-value contribution.
+
+---
+### 2.12 `DiscountedUnigramContextEstimator` (cell 108)
+
+The third `ContextDistributionEstimator` (after `UnigramContextEstimator` and
+`KGramContextEstimator`, §2.9.4), and the only one that knows about timescales.
+
+For a context `x_0 … x_t` and a window of the last `K` tokens, the far field is
+`x_0 … x_{t−K}`, and head `h` weights position `j` by `γ_h^((t−K) − j)`: **the nearest far
+token has weight 1** and the weights decay geometrically into the past. The normalizer
+
+```
+Z_far_h = Σ_{j far} γ_h^((t−K)−j)  →  1 / (1 − γ_h)   (long prompt)
+```
+
+is the effective number of far tokens head `h` integrates, and **it must travel with
+`π_h`** — `MultiTimescaleMeanFieldForwardPass.forward` multiplies the mean-field block by
+it. Returning a normalized `π` and a separate mass is the same split as
+`ExactSemanticHeadForwardPass(mass_in_L_ctx=True)`.
+
+#### 2.12.1 Two entry points, and why the contract one is lossy
+
+| Method | Returns | Use |
+|---|---|---|
+| `estimate_per_head(tokens, model, K, gammas, dead_ids)` | `vals [H, N_c]`, `keys [N_c]`, `far_mass [H]` | **The real path.** One distribution per head (one per discount), over a shared support. This is what `MTMF.predict` and the wide optimization call. |
+| `estimate(tokens, model, S_init)` | `vals [N_c]`, `keys [N_c, S_init]` | The `ContextDistributionEstimator` contract, so a discounted state can be A/B'd against the plain unigram one inside `PartitionFunctionApproximateForwardPass`. Needs a scalar `gamma`. |
+
+> ⚠ **`estimate` discards `far_mass`.** The contract has nowhere to put it. If you use that
+> path, the caller's `L_ctx` must be set by hand to `1/(1−γ) + K + 1` or the weighting is
+> silently wrong. Prefer `estimate_per_head` wherever the consumer can accept it.
+
+#### 2.12.2 Why dead tokens are dropped
+
+BOS / EOS / PAD are removed from the counts (`exclude_special=True`). **BOS is already
+carried exactly once by the sink term**, and counting it again in `π` double-counts the
+sink — the same rule the exact lane enforces via `drop_dead_states` (§2.10). This is not a
+cleanliness preference; it changes the partition function.
+
+#### 2.12.3 Truncation semantics
+
+`top_n` keeps the highest-mass tokens and renormalizes `π` over the survivors, while
+`far_mass` keeps the **full realized mass**. So truncation *redistributes* the dropped mass
+instead of shortening the effective context — the opposite of what a naive slice would do.
+`min_mass` drops far tokens below a post-normalization threshold, applied before `top_n`.
+
+#### 2.12.4 Implementation notes
+
+* Weights are computed as `exp(e · log γ)` rather than `γ ** e`: stable over the hundreds
+  of powers a long prompt needs, and exact at `γ == 1`.
+* The support is the union over heads (`counts.sum(dim=0) > 0`), so all `H` rows share one
+  `keys` tensor and `forward` can form a single `[H, N_q, N_c]` score tensor.
+* It raises rather than guesses when the context is not longer than `K` (no far field) or
+  when the far field is entirely special tokens.
+
+---
+
+### 2.13 The full-abstraction benchmark and the feature ablations (cells 128–135)
+
+#### 2.13.1 `attn-only-1l` (cells 128–131)
+
+**Cell 129 — timescale profiling.** This is the cell that makes `L_ctx` a *measurement*
+rather than a guess. `positional_profile(query_token, d_max)` evaluates the real
+positional attention factor
+
+```
+E_pos_h(d) = exp(q_h · k_p_h(t*−d) / scale)
+```
+
+for `d = 0 … d_max`, and `fit_gammas_from_profile` least-squares-fits
+`log E_pos_h(d) = a + d·log γ_h` over the far field. Then `L_ctx_h = 1/(1−γ_h)`.
+
+Design decisions in that cell that are easy to undo by accident:
+
+* **Probe tokens are real corpus tokens**, not arbitrary ids, and special tokens are
+  filtered out. `E_pos` depends on `q`, so it depends on the query token.
+* **The average over probe tokens is geometric, not arithmetic** — the profile is a
+  product of exponentials, and an arithmetic mean would be dominated by whichever query
+  token happens to attend hardest.
+* **γ is the median across probe tokens**, which is robust to the handful of tokens whose
+  fit is degenerate.
+* **`L_ctx` is clamped into `[K+2, T_STAR]`** and the clamp is printed. A head whose
+  profile is flat or rising over the fit range has no geometric horizon at all; clamping it
+  is a decision, and the print is there so it is a *visible* one.
+* **The plot is the point, not decoration.** The right-hand panel draws the measured tail
+  against `γ^(d−K)`. If a head's curve is not straight on a log axis, its geometric tail is
+  a summary, not a description, and every number derived from it inherits that.
+
+The cell ends by building `mtmf_full` — all heads, `K = K_WINDOW`, `t* = T_STAR`,
+`temperature = 1`, `top_p = 1` — which is the object every downstream cell consumes.
+
+**Cell 131 — approximation quality + feature ablations.** The ground truth is the
+**untouched** model: `real_hooks = []`, every head alive, positional embeddings on. Unlike
+the single-head / position-free lane, nothing has been removed from the model to meet the
+abstraction halfway, so the JSD is the real cost of replacing the context with
+*(fast window + per-head discounted mean field + BOS sink)*.
+
+Each row turns off exactly **one** ingredient, so the gap to `full` is that ingredient's
+contribution:
+
+| Label | Override | What it prices |
+|---|---|---|
+| `full` | — | the reference |
+| `frozen LayerNorm` | `layernorm_mode="frozen"` | the pairwise σ of §2.11.3 |
+| `no QK cross terms` | `local_cross_terms=False` | the two cross terms the old `M_local` dropped |
+| `no far pos. value` | `far_positional_value=False` | the mean positional embedding in the far-field value |
+| `no BOS sink` | `ablate_sink=True` | how much of the forward pass the sink carries |
+| `true query position` | `use_real_query_position=True` | the cost of the dummy `t*` |
+| `uniform L_ctx` | `L_ctx=L_ctx_used.mean()` | **whether per-head timescales matter at all** |
+| `K=1` / `K=8` / `K=16` | `K=…` | where the window/mean-field split should sit |
+
+The control `jsd_baseline_context_unigram` (the raw context histogram, no model at all)
+comes free with every run and is drawn as the line every bar must clear.
+
+> **Read the `uniform L_ctx` row first.** If it matches `full`, the multi-timescale story
+> is not carrying its weight on this model and the whole per-head apparatus is decoration.
+> If `K=1` matches `full`, the fast window is not either.
+
+Because `ApproximationQualityBenchmark` seeds its RNG per run, **all rows are evaluated at
+the same positions**, so the differences are paired and the SEM bars are comparable. That
+also means the pitfalls of §5.5 (3) apply in reverse: do *not* change `seed`,
+`min_position`, `max_tokens` or `n_positions` between rows.
+
+#### 2.13.2 `tiny-stories-1L-21M` (cells 132–135)
+
+The same two cells on a harder target, and a genuine test rather than a rerun:
+
+* **16 heads instead of 8** — 16 mean-field weights have to be right at once.
+* **It has an MLP.** The abstraction runs it on the reconstructed residual.
+* **It is GPT-Neo-derived, so `attn_scale == 1.0`, not `sqrt(d_head)`** (§2.11.5). MTMF
+  reads the divisor off the module and is correct; `single_layer_forward` — and therefore
+  every other pipeline in this notebook — hardcodes `sqrt(d_head)` and would be silently
+  wrong on this model.
+
+Two deviations from the `attn-only-1l` config, both forced by the model and both applied to
+every ablation row equally:
+
+* `n_ctx = 512`, so `T_STAR = 450` instead of 800 (the query position must be `< n_ctx`).
+* the benchmark window moves with it: `max_tokens = 512`, `min_position = 400`.
+
+So the TinyStories columns are comparable **with each other**, not with the `attn-only-1l`
+table (different context length, different corpus).
+
+Two further details specific to this lane:
+
+* **The corpus is joined with blank lines, not `<|endoftext|>`.** This tokenizer has
+  `bos == eos == pad == 50256`; an interior EOT would be masked out of the local window
+  *and* dropped from the far field while the sink still fires exactly once — those
+  positions would fall out of the partition entirely.
+* **The `K=20` / `K=40` rows pass `L_ctx=ts_L_ctx_used.clamp(min=K+2)`.** Widening `K` past
+  a head's own horizon is not legal: the far field would be empty and `L_global` would go
+  negative. Clamped heads become pure window heads with a vestigial mean field, which is
+  the honest reading of "this head only ever looked `K` tokens back anyway".
+
+---
+### 2.14 Wide multi-timescale mean-field optimization (cells 136–140)
+
+The wide fixed-point search of §"Wide Semantic Head Optimization" (cells 88–106), re-run on
+the **full** MTMF operator instead of the 1-head token-level one. One independent
+explore-then-optimize run per `(text, position)` pair, single GPU — there is nothing to fan
+out over heads, because every head is in play at once.
+
+#### 2.14.1 What changes relative to cells 89/91
+
+| | Cells 89/91 (token-level) | Cells 136–140 (MTMF) |
+|---|---|---|
+| Operator | `pi_to_pi_P_one_layer_topk`, one head, no positions | `MultiTimescaleMeanFieldForwardPass`, all heads, positions on |
+| State | unigram, dense `[vocab]` | **K-gram**, sparse `[N, K]` + `[N]` |
+| Mean field | the state itself | the state's **unigram marginal** via `kgram_to_unigram` |
+| Initial condition | `pi_from_context` — the raw context histogram | `DiscountedUnigramContextEstimator`, lifted to K-grams |
+| Exploration | none | no-grad power iteration of the same operator |
+| Parallelism | one head per GPU, `joblib`/`loky` | single process, single GPU |
+| Result key | `wide_results[head][i]` | `wide_mtmf_results[i]` (flat list) |
+
+Two of those deserve spelling out.
+
+**Why the state has to be K-grams.** `forward` needs an explicit `[N_q, K]` fast window per
+query — that is what makes the window block exact. So the tracked measure lives on K-grams:
+K-grams choose the active queries and carry the dynamics (the key shift), and their unigram
+marginal is what the mean-field block integrates against. Both projections happen every
+step, and `kgram_to_unigram` is differentiable, so the gradient couples them.
+
+**Why exploration is a plain power iteration, not `MetastableKGramEngine`.** The engine
+drives `abstract_forward_pass`, which is a *different operator* from this class
+(§2.11.5 alone is enough to make them disagree on some models). Mixing them would let the
+exploration and gradient phases explore different dynamics — precisely the drift §2.11
+exists to prevent. `mtmf.stationary(...)` under `torch.no_grad()` is the exploration phase,
+and it is the same code path the gradient phase uses.
+
+The cost is real and worth naming: the engine prunes on **fully aggregated flux**, so
+states reached by many weak paths survive (§2.5). A top-k rollout does not. If the support
+looks anaemic, that trade is the first place to look.
+
+#### 2.14.2 What `π` means here
+
+`π` is the **far-field** measure: the law of the context *outside* the `K` most recent
+tokens and *outside* the BOS sink, because that is the only thing `forward` reads as a mean
+field. Consequences, all enforced by `drop_dead_kgrams`:
+
+* BOS and PAD are banned from `π`'s support, on **both** sides of the JSD. Filtering only
+  one side leaves a permanent JSD floor and a gradient that forever pulls `π` toward BOS.
+* `π` handed to the forward pass must sum to 1, because `far_mass · π(c)` is the expected
+  *count* of `c` in the far field. `top_mass` is logged every iteration for exactly this
+  reason (§6, `N_ACTIVE`).
+* Do not compare `π*` against the raw unigram of a generated sample without stripping
+  special tokens first.
+
+#### 2.14.3 The initial condition
+
+`DiscountedUnigramContextEstimator.estimate_per_head` gives the discounted far-field law of
+a real prompt, one row per head, plus the realized `far_mass`. The row of the
+**longest-timescale head** (largest `L_ctx`, `γ` closest to 1) is taken as "the" discounted
+local distribution.
+
+That row is a unigram; the operator needs K-grams. The lift weights every realized
+far-field K-gram by the *same* geometric discount `γ^((t−K−1) − j)`, `j` = index of the
+K-gram's last token. By construction the `"last"`-token marginal of that K-gram measure **is**
+the estimator's unigram, except for the first `K−1` positions, which no K-gram window can
+reach and which carry the most-discounted mass of all. Both forms are stored in the result
+dict (`pi_init_vals`/`pi_init_keys`, `pi_init_unigram`, `pi_init_estimator_per_head`) so the
+identity can be checked rather than believed.
+
+`far_mass` is the **realized** `Z_far` of that prompt, not the saturated `1/(1−γ)`, and it
+is held fixed for the whole run. It is the physical context length of the initial
+condition — the analogue of `L_PROMPT` in cell 117, which §2.10 calls *the* physical
+parameter of the problem rather than a nuisance one.
+
+#### 2.14.4 The loop
+
+Structurally identical to cell 119 (§2.10's exact lane), phase for phase:
+
+```
+PHASE 1  exploration    mtmf.stationary(...) under no_grad, M = deep/shallow
+                        → drop dead K-grams → cap at N_TRACKING
+PHASE 1b union merge    torch.unique(dim=0) + scatter_, new states enter at 2·eps
+                        (or + ETA_EXPLORE · flux, a damped-Picard hybrid)
+PHASE 2  gradient       pi_logits = log π ; π = softmax(pi_logits)
+                        mean field = kgram_to_unigram(π over the FULL union)
+                        queries    = top-N_ACTIVE of π, renormalized
+                        πP         = mtmf.stationary(..., M = M_ITERATIONS, checkpointed)
+                        loss       = LOSS_SCALE · compute_aligned_jsd(π, πP)
+PHASE 3  natural grad   Sherman–Morrison on the simplex, λ = 1e-10, clip to 1.0
+PHASE 4  prune/migrate  top-N_TRACKING, drop dead, renormalize
+PHASE 5  logging
+```
+
+One deliberate difference from cell 119: **the mean field is taken over the whole union
+support, not the top-k query slice.** It is a `scatter_add`, not a forward pass, so it is
+nearly free, and it is the object `forward` integrates against — truncating it would
+truncate the physics rather than just the query set.
+
+The best iterate is recorded at `pi_vals_active`, the iterate the loss was *measured* at,
+not the post-step iterate of phase 4.
+
+#### 2.14.5 The result dict
+
+`wide_mtmf_results` is a flat list; each entry carries everything needed to re-analyze the
+run without the notebook state that produced it.
+
+| Group | Keys |
+|---|---|
+| What was optimized | `text`, `text_index`, `position`, `n_tokens`, `context_tokens` (the exact prompt), `active_heads` |
+| Operator parameters | `K`, `t_star`, `gamma [H]`, `L_ctx [H]`, `far_mass [H]`, `far_mass_saturated`, `init_head`, `init_head_slot`, `init_gamma`, `operator_name` |
+| Initial condition | `pi_init_vals [≤S, ]` / `pi_init_keys [≤S, K]`, `pi_init_unigram` (sparse COO `[vocab]`), `pi_init_estimator_per_head [H, N_c]`, `pi_init_estimator_keys [N_c]`, `n_states_init` |
+| Result | `pi_final_vals` / `pi_final_keys`, `pi_final_unigram`, `pi_best_vals` / `pi_best_keys`, `n_states_final` |
+| Traces | `losses`, `initial_loss`, `final_loss`, `best_loss`, `best_iteration`, `n_iterations`, `top_mass_history`, `n_union_history`, `explore_size_history` |
+
+Cell 138 saves `{"wide_mtmf_results": …, "config": …}` to
+`results/wide_optimizations/wide_mtmf_results_<timestamp>.pt`, with the config carrying
+every knob in §6 plus the operator's own settings. The load pattern of cell 93 works
+unchanged apart from the top-level key.
+
+#### 2.14.6 Cell 140 — single-run diagnostics
+
+Reads one entry and prints the headline numbers (initial → final → best loss, support sizes
+in both spaces, entropy and effective support size, `JSD(π₀, π_final)`, the fraction of
+final mass still on K-grams the prompt itself realized, truncation mass, per-head
+`far_mass`), then draws an 8-panel figure:
+
+| | |
+|---|---|
+| loss vs. iteration (log y, best marked) | support size vs. iteration (union / exploration) |
+| truncation mass vs. iteration, zoomed | K-gram rank–mass curve, `π₀` vs `π_final` |
+| top-20 final K-grams (+ their initial mass) | top-20 final unigrams (+ their initial mass) |
+| top-20 initial K-grams | unigram displacement scatter, init vs final |
+
+It touches nothing but `model.to_string`, so it is safe against reloaded results with no
+optimization in flight. §6 says which panel diagnoses which knob.
 
 ---
 
@@ -875,6 +1418,10 @@ largest modelling error in the 1-layer regime.
 | `ApproximateForwardPass` | Predict `p(next token \| context)` *without* running the concrete model. Pluggable: the partition-function abstraction, or any future variant. |
 | `ExactSemanticHeadForwardPass` | **Calibrate** the benchmark: drive `abstract_forward_pass` so that it reproduces the concrete model exactly (1 layer, 1 head, no positions). The zero point every other JSD is read against. |
 | `ApproximationQualityBenchmark` | **Validate** the abstraction: JSD between the real and approximated next-token distributions over a text corpus, with running mean/std. This is the cell that tells you whether anything else in the notebook is trustworthy. |
+| `DiscountedUnigramContextEstimator` | Turn a realized context into a **timescale-aware** state: the exponentially discounted far-field law, one row per head, plus the realized `Z_far`. The only estimator that knows the far field is not the whole context (§2.12). |
+| `MultiTimescaleMeanFieldForwardPass` | The abstraction of the model **as it is** — all heads, positions on, MLP applied. Simultaneously the benchmarked `ApproximateForwardPass` and the operator the fixed-point search iterates, so the two cannot drift apart (§2.11). |
+| `mtmf.positional_profile` / `fit_gammas_from_profile` | **Measure** `L_ctx` off the model's own positional embeddings instead of guessing or profiling it from data (§2.13.1). |
+| Cells 136–140 | Run the fixed-point search of the full operator from a real prompt's discounted state, over a corpus, and store everything a later analysis needs (§2.14, §6). |
 
 ### 3.2 Which method should I use?
 
@@ -908,7 +1455,7 @@ analytic values with zero data (or want to hand-override a subset, which cell 72
 `..._multigpu` when the ensemble is large enough that one GPU is the bottleneck.
 
 **"Is my abstraction any good?"**
-→ Cells 99–103. Build a `PartitionFunctionApproximateForwardPass` around your
+→ Cells 107–111. Build a `PartitionFunctionApproximateForwardPass` around your
 `forward_pass_kwargs` and run `ApproximationQualityBenchmark` on a corpus. Check the mean
 JSD **against the `jsd_baseline_context_unigram` control** — an abstraction that does not
 beat the raw context histogram is not using the model. Do this *before* trusting a
@@ -916,7 +1463,7 @@ fixed point, a QSD, or a PCCA+ macrostate, because every one of them is computed
 `abstract_forward_pass`.
 
 **"My JSD is bad — is `single_layer_forward` wrong, or is my parameterization wrong?"**
-→ Cells 104–107 (§2.10). `ExactSemanticHeadForwardPass` drives the *same*
+→ Cells 112–115 (§2.10). `ExactSemanticHeadForwardPass` drives the *same*
 `abstract_forward_pass` to a JSD of ~1e-12 on a 1-layer, single-head, position-free model.
 So the machinery is not the problem; `π`, `L_ctx`, `C_far`, `K_list`, `active_heads_list`
 or the frozen σ are. Reproduce the exact run first, then reintroduce your assumptions one
@@ -931,6 +1478,30 @@ regime — larger than everything the partition function does. §2.10.3.
 → `UnigramContextEstimator` for `n_layers == 1`, where the lift to `[N_c, S_init]` is
 exact. `KGramContextEstimator` for anything deeper — the unigram lift degenerates there
 (§2.9.4). Use `context_window=` on either to test a finite-memory hypothesis.
+
+**"I want to approximate the model as it actually is — all heads, positions on."**
+→ `MultiTimescaleMeanFieldForwardPass` (§2.11). Cell 129 measures `L_ctx` per head off the
+model's own `W_pos`; cell 131 benchmarks it against the **untouched** model with no hooks
+at all. This is the only lane where the ground truth has not been bent toward the
+abstraction, so it is the only JSD that answers "is the mean-field picture true?".
+
+**"Which of the abstraction's ingredients actually matter?"**
+→ Cell 131's ablation table (§2.13.1). Each row disables exactly one feature, all rows
+share the same sampled positions, and the context-unigram control is drawn as the line
+every bar must clear. Read `uniform L_ctx` and `K=1` first: if either matches `full`, the
+corresponding apparatus is decoration on this model.
+
+**"I want fixed points of the FULL model, not of a single head."**
+→ Cells 136–140 (§2.14). K-gram state, unigram mean field, initial condition from a real
+prompt's discounted far-field law, explore-then-optimize with pure power-iteration
+exploration. §6 is the manual for every knob.
+
+**"Which fixed-point lane should I use?"**
+→ Cell 68 for the multi-layer `abstract_forward_pass` operator. Cells 116–121 when you want
+the *exact* single-head position-free operator and `MetastableKGramEngine`'s
+aggregated-flux exploration. Cells 136–140 when you want the full model. They optimize
+**different operators**, so their fixed points are not comparable — only the JSDs of §2.13
+put them on one axis.
 
 **"How do I study a whole generation, not one snapshot?"**
 → Cell 79. It slides a window of `effective_context_window_size = 200` tokens along a
@@ -947,19 +1518,24 @@ Cell 81 then builds a pairwise JSD affinity matrix between the QSDs at different
 ### 4.1 Required execution order
 
 Cells 3 → 5 → 7 → 9 → 10 → 11 → 13 are pure definitions and must all run first.
-Cell **100** is a fourth definitions-only cell (the approximation benchmark) and depends on
-cells 9 and 10; it can be run at any point after them. Cell **105** is a fifth
-(`ExactSemanticHeadForwardPass`, §2.10) and depends on 10 and 100. Cell 107 additionally
-needs `zero_head_hook` / `remove_pos_embed_hook` from cell 7 and a `corpus` — cell 102's
+Cell **108** is a fourth definitions-only cell (the approximation benchmark, the two
+context estimators and `MultiTimescaleMeanFieldForwardPass`) and depends on cells 9 and 10;
+it can be run at any point after them. Cell **113** is a fifth
+(`ExactSemanticHeadForwardPass`, §2.10) and depends on 10 and 100. Cell 115 additionally
+needs `zero_head_hook` / `remove_pos_embed_hook` from cell 7 and a `corpus` — cell 110's
 will do.
 Cell 15 loads the model. Everything after that assumes `model`, `device`, and the
 definitions above are live. Beyond that the notebook is **not** linearly runnable —
-sections 50–58, 59–60, 61–66, 67–70, 71–82, 88–98, 99–103 are alternative experiments
+sections 50–58, 59–60, 61–66, 67–70, 71–82, 88–106, 107–111, 112–115, 116–121, 122–127,
+128–131, 132–135 and 136–140 are alternative experiments
 that each redefine overlapping globals (`losses`, `pi_vals`, `pi_keys`, `heads`, `K_list`,
 `temperature`, `p`/`top_p`, `chunk_size`, `forward_pass_kwargs`). Pick one lane and run it
-top to bottom. The benchmark lane is 100 (definitions) → 102 (run) → 103 (inspect); cell
-102 rebuilds `forward_pass_kwargs` from scratch, so it will overwrite whatever cell 72 or
-cell 80 left behind.
+top to bottom. The benchmark lane is 108 (definitions) → 110 (run) → 111 (inspect); cell
+110 rebuilds `forward_pass_kwargs` from scratch, so it will overwrite whatever cell 72 or
+cell 80 left behind. The multi-timescale lane is 108 (definitions) → 129 (profiling, builds
+`mtmf_full`) → 131 (ablations) or 137 (wide optimization) → 138 (save) → 140 (diagnostics);
+it needs nothing from cells 61–82 at all, because `MultiTimescaleMeanFieldForwardPass`
+carries its own physics (§2.11).
 
 ### 4.2 The global-state landmines
 
@@ -984,7 +1560,7 @@ commented-out `model_name` lines in cell 15 and the `### tinystories-1L` block i
 are the configurations these sections were actually developed against. Llama is the right
 choice only for the profiling sections (61–66) and `profile_deep_heads_*`.
 
-**⚠ `fold_ln=False` is mandatory — except for cells 104–107.** `extract_frozen_sigma`, the
+**⚠ `fold_ln=False` is mandatory — except for cells 112–115.** `extract_frozen_sigma`, the
 LN linearization inside `single_layer_forward`, and the `ln1.w` access all assume LayerNorm
 weights are still present as separate modules. Loading with the default `fold_ln=True`
 silently changes the semantics. The exception runs the other way: `single_layer_forward`
@@ -1000,7 +1576,7 @@ head eight times with eight different horizons — a normalized, plausible-looki
 answer. With 2 active heads it raises an opaque shape error instead. Cell 72's live config
 has this bug. Always slice:
 `L_ctx_list = [L_ctx_all[l][active_heads_list[l]] for l in range(model.cfg.n_layers)]`.
-`PartitionFunctionApproximateForwardPass` (cell 100) validates this and refuses to
+`PartitionFunctionApproximateForwardPass` (cell 108) validates this and refuses to
 construct; see §2.9.6.
 
 **⚠ Hardcoded vocabulary size.** `pi_from_context` and `pi_t_from_context` default to
@@ -1180,12 +1756,35 @@ must be edited on any other machine. `models_path` is likewise absolute and unus
     the *same* `forward_pass_kwargs` and confirm the mean JSD beats
     `jsd_baseline_context_unigram`.
 
+### 4.9 Checklist before running the multi-timescale lane
+
+This lane shares almost nothing with §4.8 — `MultiTimescaleMeanFieldForwardPass` carries
+its own physics and does not read `forward_pass_kwargs` at all.
+
+1. **`n_layers == 1`**, learned absolute positional embeddings, loaded with `fold_ln=False`
+   (the class applies `ln1.w` *and* `ln1.b`, so either load works, but the rest of the
+   notebook wants `fold_ln=False`). An MLP is fine.
+2. Cell 108 has been run, and `corpus` exists.
+3. Cell 129 has been run: `mtmf_full`, `L_ctx_used`, `K_WINDOW`, `T_STAR` are live.
+   **Look at the profile plot** before trusting `L_ctx` — a head whose measured tail is not
+   straight on a log axis has no geometric horizon, and the printed clamp notice tells you
+   which heads were forced into `[K+2, T_STAR]`.
+4. `K ≤ t* < n_ctx` and `L_ctx[h] > K + 1` for every head (both enforced in `__init__`).
+5. For a benchmark: `real_hooks = []`, `top_p = 1.0`, and `model.cfg.use_attn_result = False`.
+6. For an optimization: `torch.set_grad_enabled(True)`, all model parameters
+   `requires_grad = False`, and `MIN_POSITION` large enough that the slowest head is
+   saturated (§6, `MIN_POSITION`).
+7. Re-run the acceptance test (§2.11.8 / cell 118) if you have touched `_forward_chunk`.
+8. **Before trusting any fixed point from this lane**, read cell 131's `full` row against
+   `jsd_baseline_context_unigram`. The fixed point is a property of the operator, and the
+   ablation table is the only evidence that the operator is the model.
+
 ---
 
 ## 5. Extending the Approximation Benchmark
 
 The benchmark has exactly **two** extension points, and they are independent. Adding a new
-hypothesis means writing one subclass; nothing else in cells 99–103 changes, and the
+hypothesis means writing one subclass; nothing else in cells 107–111 changes, and the
 metrics, statistics and result format stay comparable across every variant.
 
 ```
@@ -1256,6 +1855,14 @@ too — override `_sparsify` (after thresholding) rather than `estimate` if you 
 floor applied only to the surviving support.
 
 ### 5.2 A new approximate forward pass
+
+> Two reference implementations now exist: `ExactSemanticHeadForwardPass` (§2.10), which
+> drives `abstract_forward_pass` through a patched model, and
+> `MultiTimescaleMeanFieldForwardPass` (§2.11), which implements its own forward pass end
+> to end and is also the operator of a fixed-point search. If your variant needs to be
+> optimized as well as benchmarked, copy the second one's shape — `forward` /
+> `power_iteration_step` / `stationary` alongside `predict` — so the benchmarked and
+> optimized operators stay the same object.
 
 Subclass when the question is *"what should the abstraction be?"* — this is where "no
 positional embeddings at all", "a finite sliding context window", "attention-only, MLP
@@ -1329,7 +1936,7 @@ def sliding_window_pass(model, base_kwargs, K_list, context_estimator):
 ```
 
 Worked example — **per-forward-pass `L_ctx` / `C_far` / `π`**. `ExactSemanticHeadForwardPass`
-(cell 105, §2.10) is the reference for this pattern: nothing says `forward_pass_kwargs` has
+(cell 113, §2.10) is the reference for this pattern: nothing says `forward_pass_kwargs` has
 to be constant across positions, and for anything whose horizon depends on the realized
 prompt length it must not be. It rebuilds `L_ctx_list`, `C_far_list`, `ln_avg_sigma_list`
 and the context measure inside `predict`, and patches `model.W_pos` / `model.W_E` around
@@ -1390,7 +1997,7 @@ For a 1-layer, single-head, position-free model the error floor is **zero**, and
 `ExactSemanticHeadForwardPass` reaches it. Start every attribution study from that run and
 add assumptions back one at a time; each step's JSD increment is that assumption's cost.
 
-The commented-out sweep at the bottom of cell 103 is the template: rebind
+The commented-out sweep at the bottom of cell 111 is the template: rebind
 `benchmark.approximate_pass` and call `benchmark.run(corpus)` again.
 
 ### 5.5 Pitfalls when extending
@@ -1425,3 +2032,494 @@ The commented-out sweep at the bottom of cell 103 is the template: rebind
    for the K-gram pipeline; that leaves a learnable `ln1.b` which `single_layer_forward`
    never applies, so the exact class refuses to run. The two lanes want different model
    loads — reload the model between them rather than trusting one.
+
+---
+
+## 6. Manual — every parameter of the wide multi-timescale optimization
+
+The parameters of cells 136–140, one at a time. Each entry answers the same four
+questions:
+
+* **Controls** — what the number physically is.
+* **Effect** — what moves when you change it, in the optimization *and* in the result.
+* **Tuning** — how to pick it.
+* **Diagnosis** — how to tell, from the run's own output, that it is wrong.
+
+Everything in §6.1 comes from the profiling cell (129) and is inherited by the
+optimization through `mtmf_full`; §6.2–§6.6 are the optimization cell's own knobs.
+
+> **The one-line version.** `MIN_POSITION` and `L_ctx` decide whether the physics is
+> right. `N_ACTIVE`, `N_OUTPUT` and `N_TRACKING` decide whether the *numerics* are honest.
+> `LR_MAX` and `N_ITERATIONS` decide whether it converged. Nothing else usually matters,
+> and three of those five have a printed diagnostic that tells you when they are wrong.
+
+### 6.0 What to touch first
+
+| If you are… | Touch |
+|---|---|
+| running this for the first time | nothing — run it, then read `top_mass_history` and the loss curve |
+| seeing `top_mass` well below 1 | `N_ACTIVE` ↑ |
+| seeing the loss plateau above ~1e-2 | `N_OUTPUT` ↑, then `N_ITERATIONS` ↑, then `LR_MAX` ↓ |
+| seeing the support grow without bound | `N_TRACKING` ↓ or `EXPLORE_N` ↓ |
+| out of VRAM | `QUERY_CHUNK_SIZE` ↓ first, then `K_PRUNING` ↓, then `CTX_TOP_N` set |
+| unsure the fixed point means anything | go back to cell 131's ablation table, not to these knobs |
+
+---
+
+### 6.1 The operator's parameters (inherited from cell 129)
+
+These are *not* free parameters of the optimization — they define **which operator** you
+are finding a fixed point of. Changing one changes the answer, not the convergence.
+
+#### `K_WINDOW` (→ `mtmf.K`, the K-gram width)
+
+* **Controls** the split between the exactly-resolved fast window and the mean field: the
+  last `K` tokens are computed with no approximation, everything older is mean-field. It is
+  simultaneously the **state-space width** — π lives on K-grams of exactly this length.
+* **Effect.** Larger `K` moves work from the approximate block into the exact one, so the
+  abstraction gets more faithful — and the state space gets exponentially larger, the
+  exploration slower to close, and the K-gram measure sparser for a fixed `N_TRACKING`.
+  `K = 10` on `attn-only-1l` means a "state" is a 10-token phrase, which is already long
+  enough that most states are seen once in a prompt.
+* **Tuning.** Read it off cell 131's `K=1 / K=8 / K=16` rows: pick the smallest `K` whose
+  JSD is within noise of the best. Do **not** raise `K` past any head's horizon without
+  also clamping `L_ctx` to `K+2` (§2.13.2).
+* **Diagnosis.** `n_states_final` barely above `N_ACTIVE`, and top K-grams that are all
+  unique phrases from the prompt with near-equal mass → `K` is too large for the amount of
+  mass you are tracking; the measure never aggregates. Conversely a `K` that is too small
+  shows up in cell 131, not here.
+
+#### `T_STAR` (→ `mtmf.t_star`)
+
+* **Controls** the dummy absolute query position. Every positional quantity — the window
+  embeddings, the sink score, `E_pos(K)` — is measured relative to it.
+* **Effect.** It sets *which regime* you are modelling: `t* = 800` means "a query deep in a
+  full context". Because `use_real_query_position=False`, the optimization and `predict`
+  use the same `t*`, which is what makes the benchmarked operator and the optimized
+  operator identical.
+* **Tuning.** Pick a position representative of where you care about the dynamics, subject
+  to `K ≤ t* < n_ctx`. For a fixed-point study the answer is "deep", because a fixed point
+  is a statement about a long context.
+* **Diagnosis.** Cell 131's `true query position` row prices the dummy. If that row is far
+  from `full`, `t*` is not representative of the benchmark's positions and the fixed point
+  describes a regime the model is not in.
+
+#### `L_ctx` / `gamma` (per head)
+
+* **Controls** each head's effective integration horizon, window included;
+  `γ_h = 1 − 1/L_ctx[h]`, `Z_far_h = 1/(1−γ_h)`, `W_far_h = E_pos_h(K)·Z_far_h`. One number
+  per head fixes the entire mean-field weighting (§2.11.2).
+* **Effect.** Large `L_ctx` → the mean-field block dominates the partition function, the
+  fixed point is driven by the bulk statistics of the context. Small `L_ctx` → the fast
+  window and the sink dominate, and π barely matters. This is the single parameter that
+  decides *how state-dependent* `P_π` is, i.e. whether there is an interesting fixed-point
+  problem at all.
+* **Tuning.** Do not guess it: cell 129 fits it from the model's own `W_pos`. If you must
+  override, `uniform L_ctx` in cell 131 tells you how much per-head resolution is worth.
+* **Diagnosis.** Three signals, in order. (1) The clamp notice printed by cell 129 — a head
+  clamped to `T_STAR` has no fitted horizon and its `L_ctx` is a fiction. (2) The right-hand
+  profile panel — a curve that is not straight on a log axis is not geometric, and `L_ctx`
+  is a summary of it at best. (3) In the optimization, `far_mass` printed per run: if the
+  realized `Z_far` is far below `1/(1−γ)`, the prompt is too short for that head (see
+  `MIN_POSITION`).
+
+#### `PROFILE_D_MAX`, `FIT_D_MAX`, `N_PROBE`, `PROBE_SEED`, `L_CTX_CEILING` (cell 129)
+
+* **Controls** the measurement of `E_pos(d)`: how far back it is measured, over what range
+  the geometric tail is fitted, how many query tokens the (geometric-mean) average runs
+  over, and the ceiling the fitted `L_ctx` is clamped to.
+* **Effect.** `FIT_D_MAX` is the one that matters: fitting over a range where the profile
+  has already decayed into numerical noise gives a slope of nothing. `N_PROBE` only reduces
+  the variance of the median γ.
+* **Tuning.** Fit over `[K_WINDOW, FIT_D_MAX]` with `FIT_D_MAX` chosen from the left-hand
+  plot as the distance where the curves are still above ~1e-6 of their peak. `N_PROBE` in
+  the high hundreds is plenty; the median is robust.
+* **Diagnosis.** Re-run with a different `PROBE_SEED` and compare `gamma_fit`. If the
+  medians move by more than a few percent, `N_PROBE` is too small. If the dashed fit in the
+  right-hand panel does not overlay the solid measurement, no `N_PROBE` will fix it — the
+  ansatz is wrong for that head.
+
+---
+
+### 6.2 Corpus and initial conditions
+
+#### `N_TEXTS`
+
+* **Controls** how many texts are optimized — one run per text at `N_POSITIONS_TEXT = 1`.
+* **Effect.** Purely statistical: it is the sample size for "what do fixed points reached
+  from real prompts look like?". It does not affect any individual run.
+* **Tuning.** 10 for a smoke test. For a claim about the *distribution* of fixed points
+  (how many distinct basins, how the final loss is distributed), you want the same order as
+  the token-level lane's 90.
+* **Diagnosis.** The summary block prints `initial` and `final` loss medians and ranges. If
+  the range spans orders of magnitude with 10 texts, you cannot say anything about the
+  population yet.
+
+#### `MAX_TOKENS`
+
+* **Controls** where each text is chopped.
+* **Effect.** It bounds the admissible positions and therefore the realized `far_mass`. It
+  **may exceed `n_ctx`**: the real model is never run in this cell, and everything
+  positional is measured from `t*`, not from the true index.
+* **Tuning.** At least `MIN_POSITION + N_SEPARATION + 1`. Raising it costs nothing but
+  tokenization time and admits longer, better-saturated contexts.
+* **Diagnosis.** The "only N of M texts reach …" warning means `MAX_TOKENS` (or the
+  corpus's length filter) is too small for the `MIN_POSITION` you asked for.
+
+#### `MIN_POSITION` (default `None` → derived)
+
+* **Controls** the earliest context length an initial condition may be taken from. The
+  user-facing statement of the requirement *"not too close to the beginning, so that all
+  heads are fully active"*.
+* **Effect.** This is the **most load-bearing parameter in the cell**. The mean field is
+  built from a *discounted* sum, and the discounted sum of a short prompt has not
+  saturated: the realized `Z_far` is `(1 − γ^D)/(1 − γ)` rather than `1/(1 − γ)`. Start too
+  early and the slowest head is integrating a fraction of the context it is supposed to,
+  so the operator you optimize is not the operator you benchmarked.
+* **Tuning.** Leave it `None`. The cell derives
+  `SATURATION_FACTOR · L_ctx_max + K + 1`; with `SATURATION_FACTOR = 2` the slowest head
+  has realized `1 − e⁻² ≈ 86%` of its far-field mass, with 3 it is 95%. Raise the factor if
+  you want a stricter saturation, and raise `MAX_TOKENS` with it.
+* **Diagnosis.** The cell prints the realized saturation percentage whenever
+  `MIN_POSITION < required_position`, which happens exactly when a head's `L_ctx` was
+  clamped to `T_STAR` in cell 129 (there is then *no* position in an `n_ctx`-long prompt
+  that saturates it). That warning is not cosmetic: treat it as "the slowest head's
+  timescale is not measurable on this model", and either drop that head from
+  `active_heads` or accept that its mean field is truncated.
+
+#### `SATURATION_FACTOR`
+
+* **Controls** how many integration horizons of context count as "fully active";
+  saturation is `1 − e^(−factor)`.
+* **Effect / Tuning / Diagnosis.** See `MIN_POSITION`. 2 is a reasonable default, 3 is
+  strict, below 1.5 the mean field of the slowest head is visibly truncated.
+
+#### `N_POSITIONS_TEXT`, `N_SEPARATION`, `POSITION_SEED`
+
+* **Controls** how many independent initial conditions are drawn per text, the minimum
+  token separation between them, and the RNG seed. Uses `sample_optimization_positions`
+  from cell 89, so the sampling is identical to the token-level lane.
+* **Effect.** More positions per text is cheaper than more texts (one tokenization, one
+  file) but the initial conditions are correlated — overlapping contexts share most of
+  their far field. `N_SEPARATION` bounds that correlation.
+* **Tuning.** 1 position per text for an unbiased sample of prompts. If you specifically
+  want "does the fixed point depend on *where* in this text I start?", raise
+  `N_POSITIONS_TEXT` and set `N_SEPARATION` to at least `L_ctx_max` so the two far fields
+  barely overlap.
+* **Diagnosis.** Two runs from the same text converging to the same π with
+  `N_SEPARATION < L_ctx_max` is not evidence of a basin — it is evidence that they read
+  nearly the same context. Compare `context_tokens` before concluding anything.
+
+#### `INIT_HEAD` / `INIT_GAMMA` (derived: `argmax L_ctx`)
+
+* **Controls** which head's discount builds the initial K-gram measure.
+* **Effect.** A larger γ spreads the initial mass further back into the prompt (a flatter,
+  higher-entropy π₀); a smaller γ concentrates it near the window edge. It only sets the
+  *starting point* — the fixed point itself does not depend on it, if the optimization
+  converges.
+* **Tuning.** The derived choice (the longest timescale) is the right default: it gives the
+  broadest support, which is the most forgiving seed for the exploration phase.
+* **Diagnosis.** Cell 140's "entropy (K-gram)" line, initial vs final. A π₀ with much lower
+  entropy than π_final means the optimization had to *discover* most of its support, which
+  is slow and exploration-limited; consider a longer timescale or a larger `EXPLORE_N`.
+
+---
+
+### 6.3 The sparse forward passes
+
+These are the numerics. None of them changes the operator; all of them change how
+faithfully it is evaluated, and every one has a printed diagnostic.
+
+#### `N_ACTIVE` — queries per forward pass
+
+* **Controls** how many K-grams are used as queries in each `forward` call: the top
+  `N_ACTIVE` states of π, renormalized to sum to 1.
+* **Effect.** This is the **top-k truncation of §2.1, on the K-gram state space**. States
+  outside the top `N_ACTIVE` contribute nothing to `πP` and receive **exactly zero
+  gradient**. The loss landscape is discontinuous wherever top-k membership changes. It is
+  also the dominant term in the per-iteration cost: the `[H, N_q, N_c]` score tensor and
+  the `[N_q, |V|]` top-k both scale linearly in it.
+* **Tuning.** Raise it until `top_mass` sits near 1. 256 is the notebook's standing value
+  (cells 117/119); with `K = 10` and a broad π you may need more, because K-gram mass is
+  spread over far more states than unigram mass.
+* **Diagnosis.** **`top_mass_history` is the diagnostic, and it is plotted** (cell 140,
+  panel 3). `top_mass` is the fraction of π carried by the active query set. Before the
+  renormalization in phase 2 it is the effective rescaling of the context: at
+  `top_mass = 0.7` you are evaluating the operator as if the far field were 30% shorter
+  than it is. Want ≳ 0.95. If it *falls* over the run, π is spreading faster than
+  `N_ACTIVE` can follow.
+
+#### `N_OUTPUT` — states kept in `πP`
+
+* **Controls** the size of the support of `πP` after each power-iteration step.
+* **Effect.** Subtle and important. The loss is `compute_aligned_jsd(π, πP)`, which puts
+  states missing from one side at `1e-10` and renormalizes. So **any mass of π that lies
+  outside `πP`'s `N_OUTPUT` states is a JSD floor the optimizer cannot get under** by
+  redistributing; it can only get under it by *concentrating π onto those states*. That is
+  a real pressure on the answer, not just on the convergence rate: too small an `N_OUTPUT`
+  biases the fixed point toward being more concentrated than it should be.
+* **Tuning.** Keep `N_OUTPUT ≈ N_ACTIVE` (the notebook's default) and let `N_TRACKING`
+  exceed both — the gradient then genuinely has to concentrate π, which is the intended
+  dynamics. If you want a broad fixed point, raise `N_OUTPUT` and `N_ACTIVE` together.
+* **Diagnosis.** A loss curve that drops fast and then plateaus on a hard floor, while
+  `n_states_final` sits pinned near `N_OUTPUT` and the K-gram rank–mass curve (cell 140,
+  panel 4) shows a cliff exactly at rank `N_OUTPUT`. That cliff is the parameter, not the
+  physics.
+
+#### `K_PRUNING` — successors kept per query
+
+* **Controls** how many next-tokens survive per query inside `power_iteration_step`
+  (`topk` over the `[N_q, |V|]` transition rows, before the key shift).
+* **Effect.** Bounds the branching factor of the discovered dynamics. Too small and the
+  support can only ever grow along the model's most likely continuations, which biases the
+  measure toward low-entropy paths. The intermediate tensors are
+  `N_ACTIVE × K_PRUNING × K` integers, so it is the main *memory* term of the power
+  iteration.
+* **Tuning.** 512 is the notebook default. Compare it against the model's actual branching
+  factor at these positions — cell 101 (`measure_branching_factor`) computes it. If the
+  typical nucleus is 50 tokens wide, 512 is generous and can be lowered for speed.
+* **Diagnosis.** Raise `K_PRUNING` 2× and re-run one text. If the final loss or the top
+  K-grams move, it was binding.
+
+#### `N_TRACKING` — cap on `|support(π)|`
+
+* **Controls** how many K-gram states survive the prune-and-migrate step at the end of
+  each iteration, and also caps the exploration's contribution.
+* **Effect.** The memory of the run. It bounds the union support (and hence the size of the
+  `pi_logits` parameter, the mean-field `scatter_add`, and the `torch.unique` in the union
+  merge). Too small and the exploration's discoveries are thrown away before the gradient
+  can act on them; too large and you pay for tens of thousands of states carrying `2·eps`.
+* **Tuning.** 8192 is the default here. Cell 117 uses `d_vocab // 4` for a *unigram* state
+  space; that is far too generous for K-grams, where almost all states have negligible
+  mass. Set it a few times `N_ACTIVE`.
+* **Diagnosis.** `n_union_history` (cell 140, panel 2). If it saturates flat at
+  `N_TRACKING + EXPLORE_N`, you are pruning every iteration and the cap is binding — check
+  that the pruned mass is negligible by comparing `n_states_final` with the rank–mass
+  curve's tail. If it is still climbing at the end of the run, the support has not closed
+  and the fixed point is not one.
+
+#### `QUERY_CHUNK_SIZE`
+
+* **Controls** how many queries `forward` processes at a time when forming the
+  `[H, N_q, N_c]` mean-field score tensor. Set on a `copy.copy` of `mtmf_full`, so the
+  benchmarked object is not mutated.
+* **Effect.** Pure memory/speed trade; the result is bit-identical (the chunks are
+  concatenated, not reduced). Peak VRAM for that tensor is
+  `H × QUERY_CHUNK_SIZE × N_c × 4 bytes`, times a small constant for the intermediates.
+* **Tuning.** Largest value that fits. `None` (one shot) is fastest when `N_c` is small.
+* **Diagnosis.** OOM inside `_forward_chunk` → lower it. Nothing else changes.
+
+#### `CTX_TOP_N` — cap on the mean field's support
+
+* **Controls** how many unigram states the mean field keeps (`None` = all of them).
+* **Effect.** The mean field is the `N_c` axis of every score tensor, so this is the other
+  memory lever. **But it is not free**: truncating π's unigram marginal and renormalizing
+  redistributes the dropped mass onto the survivors, which is a different operator. The
+  same warning as §2.12.3, one level up.
+* **Tuning.** Leave it `None` unless memory forces it. If you must set it, make it large
+  enough that the dropped mass is ≪ the loss you are trying to reach.
+* **Diagnosis.** The `|mean field|` figure in the periodic log line tells you what `N_c`
+  actually is. If it is a few thousand, `None` is cheap and you should not be truncating.
+
+---
+
+### 6.4 The gradient loop
+
+#### `N_ITERATIONS`
+
+* **Controls** gradient steps per run, and (through the cosine schedule) the learning-rate
+  trajectory — the schedule is `N_ITERATIONS`-normalized, so halving it does not just stop
+  early, it **anneals twice as fast**.
+* **Effect.** Wall-clock is linear in it.
+* **Tuning.** 1000 here (10 runs); cell 117 uses 3000 for a single run. Raise it before you
+  raise `LR_MAX`.
+* **Diagnosis.** The loss curve in panel 1. Still descending at the right-hand edge → too
+  few. Flat for the last half → you are paying for nothing, and `best_iteration` will tell
+  you exactly where it stopped improving.
+
+#### `LR_MAX`, `LR_MIN`
+
+* **Controls** the cosine-annealed step size on `pi_logits`, from `LR_MAX` at iteration 0 to
+  `LR_MIN` at `N_ITERATIONS`.
+* **Effect.** After the Sherman–Morrison natural-gradient correction and `clip_grad_norm_`
+  to 1.0, the step is a **bounded** move in the natural (Fisher) metric — so `LR_MAX = 1.0`
+  is a step of order one *in KL*, not in Euclidean distance. That is why these values look
+  enormous compared to a normal SGD learning rate.
+* **Tuning.** `1e0 → 1e-1` is the notebook's standing pair across cells 52, 89 and 117. Do
+  not change it before you have ruled out `N_OUTPUT` and `N_ACTIVE` as the cause of a bad
+  loss.
+* **Diagnosis.** A loss curve that is noisy and non-monotonic at the start and only settles
+  once the schedule anneals → `LR_MAX` too high. A loss that descends smoothly but has not
+  arrived by the end → `LR_MAX` too low *or* `N_ITERATIONS` too small; prefer raising
+  iterations, since the clipped natural gradient makes larger steps mostly wasted motion.
+
+#### `M_ITERATIONS` — power iterations per gradient step
+
+* **Controls** how many times `P_π` is applied inside the differentiated `stationary` call.
+  The mean field is derived **once, outside** the loop, so it stays frozen for all `M`
+  steps while remaining differentiable in π.
+* **Effect.** `M = 1` makes the loss `JSD(π, πP)`, a one-step self-consistency residual.
+  `M > 1` makes it `JSD(π, πP^M)`, which is a **weaker** condition (it tolerates period-`M`
+  cycles) but has a better-conditioned gradient, and costs `M` checkpointed forward passes
+  plus their recomputation in backward.
+* **Tuning.** Keep `M = 1`. Raise it only if you suspect the optimizer is being deflected
+  by short-lived transients, and then interpret the result as a statement about `P^M`.
+* **Diagnosis.** If `M > 1` gives a much lower loss than `M = 1` from the same start, you
+  have found a cycle, not a fixed point.
+
+#### `LOSS_SCALE`
+
+* **Controls** the multiplier on the JSD; `1e5 / d_vocab` here, matching cell 117.
+* **Effect.** **It is redundant with `LR_MAX`** — the natural gradient is linear in the
+  loss, and the only non-linearity is `clip_grad_norm_`. So `LOSS_SCALE` mostly decides
+  *whether the clip is active*, and therefore whether you are doing natural-gradient
+  descent or normalized natural-gradient descent.
+* **Tuning.** Leave it. Its real job is making the printed loss a readable number that is
+  comparable with cells 68, 117 and 119.
+* **Diagnosis.** Print `grad_max` (the periodic log line does). If it is pinned at the clip
+  bound for the entire run, every step has the same length and the loss magnitude is doing
+  nothing — that is usually fine, but it means `LR` is the *only* step-size control.
+
+#### `LMBDA`, `MAX_GRAD_NORM`
+
+* **Controls** the damping in `A⁻¹ = 1/(π + λ)` and the gradient-norm clip.
+* **Effect.** π is extremely sparse, so `1/π` explodes for the `2·eps` states the union
+  merge just introduced. `λ = 1e-10` caps that at `1e10`; the clip then bounds the step.
+  Both are load-bearing — without them a single dead state can dominate the update.
+* **Tuning.** Do not. They are the same values as cells 52, 89 and 117.
+* **Diagnosis.** `grad_max` ≫ `grad_mean` by many orders of magnitude, or a non-finite
+  gradient warning (the loop breaks and keeps the best iterate), means the damping is being
+  overwhelmed — usually because `2·eps` states are entering the top-`N_ACTIVE` query set.
+  Raise `N_TRACKING`'s pruning pressure or lower `EXPLORE_N` rather than raising `λ`.
+
+#### `PRINT_ITERATIONS`
+
+* **Controls** logging cadence only. No effect on the result.
+
+---
+
+### 6.5 The exploration phase
+
+Exploration is what lets the support **grow**; the gradient can only redistribute mass over
+the states it is given. All of these are no-grad.
+
+#### `EXPLORE_EVERY`, `EXPLORE_DEEP_M`, `EXPLORE_SHALLOW_M`
+
+* **Controls** the cadence: `EXPLORE_SHALLOW_M` power iterations every step, and
+  `EXPLORE_DEEP_M` every `EXPLORE_EVERY` steps.
+* **Effect.** A shallow step adds the immediate successors of the current top states — one
+  token of look-ahead. A deep step runs the operator to (approximate) convergence and can
+  discover states many transitions away, at `EXPLORE_DEEP_M ×` the cost.
+* **Tuning.** `1 / 10 / 50` is a reasonable default (cell 117 uses `1 / 30 / 50` with the
+  aggregated-flux engine). Raise `EXPLORE_DEEP_M` if the support is still opening up late
+  in the run; lower `EXPLORE_EVERY` if the loss drops in visible steps synchronized with
+  the deep explorations.
+* **Diagnosis.** `explore_size_history` and `n_union_history` plotted together (panel 2).
+  Sawtooth spikes at multiples of `EXPLORE_EVERY` that do not decay → the deep exploration
+  keeps finding new states and the support has not closed. Both curves flat from early on →
+  exploration is doing nothing and you can turn the cadence down.
+
+#### `EXPLORE_N`
+
+* **Controls** how many states the exploration keeps per step before the union merge.
+* **Effect.** The width of the frontier. Larger means more candidates offered to the
+  gradient each step, a larger union support, and more `2·eps` states diluting π.
+* **Tuning.** A few times `N_ACTIVE`. 2048 with `N_ACTIVE = 256` is a wide frontier.
+* **Diagnosis.** If `n_union_history` is dominated by `EXPLORE_N` (i.e. `N_union ≈
+  |support(π)| + EXPLORE_N` every step) and the loss is not improving, the frontier is
+  being generated and discarded — lower `EXPLORE_N` or raise `ETA_EXPLORE`.
+
+#### `ETA_EXPLORE`
+
+* **Controls** the damped-Picard blend: newly discovered states enter π with
+  `ETA_EXPLORE × their exploration flux` instead of `2·eps`.
+* **Effect.** **`0.0` (the default) is pure gradient descent on JSD.** Any positive value
+  makes the method a **hybrid** — gradient descent plus a Picard step — which converges
+  faster but changes what the fixed point is a fixed point *of*: you are no longer purely
+  minimizing the self-consistency residual.
+* **Tuning.** Keep it 0 for a clean result. Raise it (1e-2 … 1e-1) only when the gradient
+  demonstrably cannot lift new states out of `2·eps` in the iterations you have, and say so
+  when reporting the result.
+* **Diagnosis.** Compare a run at `ETA_EXPLORE = 0` and at `0.05`. If the final π differs
+  materially, the answer depends on the hybrid and the pure-gradient run is the one to
+  report.
+
+---
+
+### 6.6 Storage and diagnostics
+
+#### `STORE_TOP_K`
+
+* **Controls** how many K-gram states are kept per stored measure (`pi_init`, `pi_final`,
+  `pi_best`). Note the **unigram** measures are stored in full, as sparse COO.
+* **Effect.** File size and the resolution of any later tail analysis. `4096` states × `K`
+  int64 ≈ 0.3 MB per measure.
+* **Tuning.** Raise it if you intend to study the tail of π (rank–mass slopes, support
+  overlap between runs); the default is comfortably above `N_OUTPUT`.
+* **Diagnosis.** `n_states_final > STORE_TOP_K` in the result dict means the stored measure
+  is truncated relative to the one that was optimized — the rank–mass curve will end at
+  `STORE_TOP_K` rather than at the true support size.
+
+#### `EPS`
+
+* **Controls** the floor mass given to states entering the union support (`2·eps`).
+* **Effect / Tuning.** `1e-10`, same as cells 60 and 117. It interacts with `LMBDA`: a
+  state at `2e-10` gets a natural-gradient prefactor of ~`5e9`. Do not lower it.
+
+#### Cell 140: `RUN_INDEX`, `TOP_KGRAMS`, `TOP_UNIGRAMS`, `LABEL_CHARS`, `BAR_HEIGHT`
+
+Presentation only — which run to summarize, how many bars per histogram, and how the
+decoded K-gram labels are truncated. None of them touches the data.
+
+---
+
+### 6.7 A tuning recipe
+
+1. **Fix the operator first.** Run cell 129, look at the profile plot, and run cell 131.
+   If `full` does not comfortably beat `jsd_baseline_context_unigram`, stop — no setting in
+   §6.2–§6.6 will make a fixed point of a bad operator mean anything.
+2. **Run one text** with the defaults and `N_ITERATIONS = 200`.
+3. **Read `top_mass_history`.** Raise `N_ACTIVE` until it sits near 1.
+4. **Read the loss curve and the rank–mass curve.** A plateau with a cliff at rank
+   `N_OUTPUT` → raise `N_OUTPUT` (and `N_ACTIVE` with it).
+5. **Read `n_union_history`.** Still climbing → the support has not closed: raise
+   `EXPLORE_DEEP_M` or `N_ITERATIONS`. Flat at the cap → raise `N_TRACKING` or accept it.
+6. **Only now** touch `N_ITERATIONS` and `LR_MAX`, in that order.
+7. **Re-run the same text with a different `POSITION_SEED`.** A fixed point that does not
+   survive a different initial condition from the same text is a local artifact.
+8. Scale to `N_TEXTS`.
+
+### 6.8 Symptom → parameter
+
+| Symptom | Most likely cause |
+|---|---|
+| `top_mass` < 0.9 and falling | `N_ACTIVE` too small |
+| loss plateaus on a hard floor; rank–mass cliff at `N_OUTPUT` | `N_OUTPUT` too small |
+| `n_union_history` still climbing at the last iteration | support not closed: `N_ITERATIONS`, `EXPLORE_DEEP_M` |
+| `n_union_history` pinned at `N_TRACKING + EXPLORE_N` | `N_TRACKING` binding |
+| loss noisy and non-monotonic early | `LR_MAX` too high |
+| non-finite gradient warning | `2·eps` states reaching the query set: `EXPLORE_N` ↓, `N_TRACKING` ↓ |
+| `far_mass` ≪ `1/(1−γ)` for some head | `MIN_POSITION` too early, or that head's `L_ctx` was clamped |
+| saturation warning at run start | `L_ctx` clamped to `T_STAR` in cell 129 — the head has no measurable horizon |
+| final π ≈ initial π, loss barely moved | the operator is barely state-dependent: check `L_ctx` (§6.1) before blaming the optimizer |
+| every run converges to the same π regardless of text | either a genuine global attractor or `N_OUTPUT` is so small that only the operator's own top states survive — check the rank–mass cliff |
+| OOM in `_forward_chunk` | `QUERY_CHUNK_SIZE` ↓ |
+| OOM in `power_iteration_step` | `K_PRUNING` ↓ or `N_ACTIVE` ↓ |
+
+### 6.9 Cost model
+
+Per gradient iteration, the dominant terms:
+
+```
+exploration :  EXPLORE_M × [ forward(N_ACTIVE queries) + topk(N_ACTIVE × |V|) ]      no grad
+gradient    :  M_ITERATIONS × forward(N_ACTIVE queries) × ~2                          checkpointed
+                                                          ^ recomputed in backward
+forward mem :  H × min(N_ACTIVE, QUERY_CHUNK_SIZE) × N_c × 4 bytes × O(1) intermediates
+power it.mem:  N_ACTIVE × |V| × 4 bytes  (the dense transition rows before topk)
+             + N_ACTIVE × K_PRUNING × K × 8 bytes  (the shifted keys, before unique)
+union merge :  torch.unique over [(N_TRACKING + EXPLORE_N), K]
+```
+
+Wall-clock is `N_TEXTS × N_ITERATIONS ×` the above; the exploration is roughly
+`(EXPLORE_SHALLOW_M + EXPLORE_DEEP_M / EXPLORE_EVERY)` forward passes per step on average,
+so the deep cadence is cheap unless `EXPLORE_EVERY` is small.
