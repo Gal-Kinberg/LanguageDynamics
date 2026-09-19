@@ -2523,3 +2523,582 @@ union merge :  torch.unique over [(N_TRACKING + EXPLORE_N), K]
 Wall-clock is `N_TEXTS × N_ITERATIONS ×` the above; the exploration is roughly
 `(EXPLORE_SHALLOW_M + EXPLORE_DEEP_M / EXPLORE_EVERY)` forward passes per step on average,
 so the deep cadence is cheap unless `EXPLORE_EVERY` is small.
+
+---
+
+# 7. Reduced mean-field fixed points: hunting saddles instead of repetitions
+
+> **Cells 142–155.** A second fixed-point lane for `MultiTimescaleMeanFieldForwardPass`.
+> It solves the *same* operator as §2.14 — `mtmf.forward` is called exactly as the
+> benchmark calls it, byte for byte — but changes **what is tracked** and **how the
+> fixed point is solved for**, so that *unstable* and *saddle* fixed points become
+> reachable. Depends on cells 108 and 129 only (`mtmf_full`, `L_ctx_used`, `corpus`).
+
+## 7.1 Why the K-gram lane can only find repetitions
+
+This is a counting argument, and it is the reason cells 136–140 converge to repetition
+loops no matter how the optimizer is tuned.
+
+A fixed point with unigram entropy `H₁` and per-token conditional entropy
+`h = H(next | window, π)` has a K-gram measure of entropy
+
+```
+H(π_K) ≈ H₁ + (K−1)·h          [nats]
+```
+
+and a measure of entropy `S` needs `≈ e^S` explicit states before `top_mass` approaches
+1. Cell 137's budget is `N_ACTIVE = 512` (ln = 6.24 nats) and
+`N_TRACKING = d_vocab/4 = 12065` (ln = 9.40 nats). Cell 145 measures `H₁` and `h`
+directly. On `attn-only-1l` with a real Wikipedia prompt:
+
+| state | `H₁` | `h` | `H(π_K)` at K=10 | states needed | best possible `top_mass` at `N_ACTIVE=512` |
+|---|---|---|---|---|---|
+| a real prompt's discounted far field | 4.73 | 4.53 | **45.5 nats** | 10^19.8 | **9e-18** |
+| the repetition fixed point it falls into | 2.51 | 1.38 | 14.9 nats | 10^6.5 | 1.7e-4 |
+| a pure `'.'` loop (text 1) | 0.03 | 0.03 | 0.3 nats | 10^0.1 | **1.0** |
+
+Inverting the inequality `ln N_TRACKING ≥ H₁ + (K−1)h` gives the honest ceiling
+
+```
+K_max ≈ 1 + (ln N_TRACKING − H₁) / h
+```
+
+which on real prompts comes out at **K_max ≈ 1.85 – 2.10**, against the `K_WINDOW = 10`
+cell 129 actually uses. **A sparse list of K-grams can represent a fixed point only if
+that fixed point is nearly deterministic**, i.e. only if it is a repetition loop. The
+optimizer is not failing; the state space excludes the answer.
+
+## 7.2 The fix: put the state in Δ(V), keep the operator
+
+`forward` reads the mean field only through, per head `h` and query `q`,
+
+```
+A_h(q) = Σ_c m(c)·exp(q_h·k_h(c)/s)                 (scalar)
+B_h(q) = Σ_c m(c)·exp(q_h·k_h(c)/s)·v_h(c)          (d_head vector)
+```
+
+both **linear in `m`**. At frozen `m` the K-gram chain is an ordinary linear Markov
+operator, so its stationary measure is a *slaved* variable. The only genuinely nonlinear,
+self-consistent equation is on the unigram marginal:
+
+```
+m = G(m),    G(m) = Σ_q w_q(m) · P(· | q, m),    w_q(m) ∝ m(last token of q)
+```
+
+`ReducedMeanFieldOperator` implements exactly that. The window contents come from the
+product ansatz `π(x_{t−K+1..t}) = ∏ m(x_i)`, realized as a **frozen active set**: every
+`topk` and every sample happens in `refresh()` and nowhere else, so `G` is exactly smooth
+in `m` between refreshes — which is what makes it Newton-solvable. Two variance controls
+matter and are not optional: rows are allocated **proportional to `m`** (query weight has
+an ESS of order 10, so uniform allocation wastes almost every draw), and the filler slots
+are **stratified quantiles** of `m`, not i.i.d. draws (error `O(1/R)`, not `O(1/√R)`).
+With `n_query=256, n_fill=8` the residual SAA noise measures **σ(|r|) ≈ 8e-4**, and it is
+reported as the honest error bar on every solve.
+
+## 7.3 What the reduction buys
+
+| | cells 136–140 (K-gram) | cells 142–155 (reduced) |
+|---|---|---|
+| state | sparse `[N, K]` K-gram measure | dense `m ∈ Δ(V)` |
+| `top_mass` on a real prompt | ≤ 1e-17 (§7.1) | **1.00** |
+| smooth in the state? | no (top-k churn, STE) | yes, between refreshes |
+| solver | natural-gradient descent on `JSD(π, πP)` | **JFNK** (Newton + GMRES on JVPs) |
+| residual reached | plateaus ~1e-2 (scaled) | **8e-8**, quadratic |
+| finds saddles? | no — descent on `‖r‖²` is flattest exactly along the near-critical directions | **yes** — Newton is stability-agnostic |
+| cost of one `G` | one explore + one gradient pass | ~0.05 s |
+
+## 7.4 The two-timescale reading (what "stationarity" means here)
+
+The discounted mean field obeys an *exact* recursion,
+`m_h(t+1) = m_h(t) + ε_h(δ_{x_{t+1}} − m_h(t))` with `ε_h = 1/L_ctx,h`. That is
+constant-step-size **stochastic approximation**, whose ODE limit is
+
+```
+ṁ = G(m) − m
+```
+
+Consequences used throughout this section:
+
+* **Fixed points of `G` are the equilibria of the real generation dynamics.**
+* **The stability test is `Re λ(DG) < 1`, not `|λ(DG)| < 1`.** A mode at `λ = −3` is
+  Picard-unstable but ODE-stable. `picard()` below is damped precisely so that it *is*
+  the Euler discretization of the ODE and cannot be fooled this way.
+* **The non-decaying "buzzing" is an O(√ε) fluctuation**, not a failure to converge:
+  around `m*`, `m ≈ m* + √ε ξ` with `ξ` an Ornstein–Uhlenbeck process driven by
+  `A = DG − I`. Variance is amplified in near-critical directions — critical slowing
+  down is an observable signature of being near a saddle.
+* **`1/L_ctx` is the temperature of topic switching.** Escape from a basin goes as
+  `exp(−ΔΦ·L_ctx)`, so the barrier at the saddle is what sets how hard the model locks
+  into a topic or a repetition loop.
+* The assumption the whole picture rests on is `τ_mix ≪ L_ctx`. Cell 147 measures both
+  and prints the ratio — the notebook computes each number elsewhere and never divides
+  them.
+
+`split_spectra` decomposes the Jacobian into the two physically distinct pieces:
+
+```
+D_u G_inner  -> how the FAST window law relaxes at frozen m   -> tau_mix
+D_m G_inner  -> the MEAN-FIELD LOOP GAIN                      -> is there a problem at all?
+DG_slaved = (I - D_uG)^-1 D_mG  -> the Jacobian of the true slow dynamics
+```
+
+**Read the loop gain first.** If it is ≈ 0 the operator is barely state-dependent, there
+are no saddles to find, and §6.8's "final π ≈ initial π" symptom is the physics rather
+than the optimizer.
+
+## 7.5 Preconditions
+
+1. Cells 3, 5, 7, 9, 10, 11, 13 and **108** have been run; **129** has been run so
+   `mtmf_full`, `L_ctx_used`, `K_WINDOW`, `T_STAR` and `corpus` are live.
+2. `torch.set_grad_enabled(True)` — the JVPs need forward-mode autograd. Model
+   parameters stay `requires_grad = False`.
+3. **`top_p = 1.0` and `temperature = 1.0`.** Nucleus filtering makes the operator
+   non-smooth, biases the straight-through gradient, and manufactures artificial
+   reducibility; the Jacobian would simply be wrong. `mtmf_full` is already built this
+   way by cell 129.
+4. A fixed point is a property of the operator, so cell 131's `full` row must
+   comfortably beat `jsd_baseline_context_unigram` before any of this means anything.
+
+## 7.6 Known limitation of the Jacobian
+
+`_forward_chunk` deliberately detaches the `context_vals` that feed `sigma_pos`
+(§2.11.3). The JVP therefore reproduces the *σ-frozen* Jacobian, not the full one.
+Measured against central finite differences on a direction inside `supp(m)`, the gap is
+**≈ 5 %, and it is eps-independent** (4.92e-2, 4.87e-2 at eps = 1e-4, 1e-5), which
+confirms it is that systematic term and not non-smoothness. It is harmless for Newton
+(inexact Newton still converges — the runs below reach 8e-8) but it puts a ~5 % error bar
+on every eigenvalue quoted here. Eigenvalues near the stability boundary `Re λ = 1`
+should be treated as "marginal", not as decided.
+
+## 7.7 What these cells found on `attn-only-1l` (K=10, t*=800, all 8 heads)
+
+Measured with `N_QUERY=256, N_FILL=8, CTX_TOP_N=2048`, `top_p = temperature = 1`, on the
+Wikipedia corpus of cell 110. Runtimes on one RTX 5000: cell 146 ≈ 40 s, cell 147 ≈ 200 s,
+cell 148 ≈ 20 min, cell 149 ≈ 6 min, cell 150 ≈ 8 min, cell 151 ≈ 12 min, cell 152 ≈ 25 min.
+
+### (a) The representability audit — why the K-gram lane finds only repetitions (cell 145)
+
+| state | `H₁` | `h` | `H(π_K)` @ K=10 | states needed | best `top_mass` @ `N_ACTIVE`=512 | `K_max` |
+|---|---|---|---|---|---|---|
+| text 0, real prompt | 4.729 | 4.531 | **45.5** | 10^19.8 | **8.8e-18** | **2.03** |
+| text 2, real prompt | 4.597 | 4.946 | 49.1 | 10^21.3 | 2.4e-19 | 1.97 |
+| text 4, real prompt | 4.804 | 5.425 | 53.6 | 10^23.3 | 2.6e-21 | 1.85 |
+| text 0, fixed point | 2.507 | 1.379 | 14.9 | 10^6.5 | 1.7e-4 | 6.00 |
+| text 1, fixed point (`'.'` loop) | 0.032 | 0.031 | 0.3 | 10^0.1 | **1.00** | 300 |
+
+Read the last column against `K_WINDOW = 10`. **On a real prompt the honest ceiling is
+`K_max ≈ 1.85 – 2.03`.** The only row a sparse K-gram list can carry is the pure
+repetition loop, which is exactly what cells 136–140 return.
+
+### (b) The solve (cell 146)
+
+```
+SAA (filler) noise sigma(|r|) at m_init     9.1e-4
+JVP vs central finite differences           5.7e-2 .. 6.9e-2, eps-INDEPENDENT (the sigma_pos detach)
+damped Picard   |r|  7.7e-2 -> 1.2e-4       150 steps
+JFNK            |r|  5.0e-3 -> 9.2e-8       8 steps, quadratic
+```
+
+JFNK reaches four orders below Picard's plateau and below the SAA bar, so the surrogate
+is solved essentially exactly and the residual error is the *operator's* sampling error,
+not the solver's.
+
+### (c) Attractors — one operator, many basins (cell 149)
+
+`t*` and `far_mass` do not depend on the prompt, so every text is a different initial
+condition of the **same** map:
+
+| text | fixed point | `H₁` | ESS |
+|---|---|---|---|
+| 0 | `'ists' .29 / ' anarch' .28 / ',' .19` | 2.50 | 12.2 |
+| 1 | `'.' .995` | 0.03 | 1.0 |
+| 2 | `'ic' .48 / ' Ital' .48` | 1.00 | 2.7 |
+| 3 | `' Al' 1.000` | 0.004 | 1.0 |
+| 4 | `'us' .48 / ' Ze' .48` | 1.01 | 2.7 |
+| 5 | `' Lincoln' .90` | 0.74 | 2.1 |
+
+The two-token ones are **period-2 cycles** (`' Ital'→'ic'→' Ital'`); a 2-cycle appears in
+the mean field as two tokens at ≈½ each, `H₁ ≈ ln 2 = 0.69`.
+
+### (d) An UNSTABLE fixed point (cells 150–151)
+
+Between attractor A = `' Lincoln'` (text 5) and B = `'.'` (text 1), `μ(c)` crosses zero
+three times: at both endpoints (`dμ/dc < 0`, the attractors) and **once in the interior
+with `dμ/dc = +0.51`**. Bisecting that crossing and polishing with JFNK:
+
+```
+state          ' Lincoln' 0.784 | '.' 0.175 | ',' 0.007 | ' and' 0.006
+residual       |r| = 6.2e-8          (JFNK: 1.8e-2 -> 6.2e-8, and it STAYED on the saddle,
+                                      JSD(start,end) = 8.5e-4)
+H = 0.8095     ESS = 2.25            HIGHER entropy than either neighbour (0.736 and 0.033)
+MORSE INDEX    1                     exactly one unstable direction -> an index-1 saddle
+max Re lambda  +1.40 .. +1.71        > 1  => UNSTABLE
+loop gain      1.44 .. 1.75          > 1  => locally expanding, which is REQUIRED for two
+                                      attractors to coexist (a globally contracting map
+                                      has a unique fixed point)
+|<eigenvector, phi>|  = 0.9999       the unstable direction IS the A-B tilt
+eigenvector    '.' -0.717 , ' Lincoln' +0.697 , everything else < 0.004
+untied growth  Re mu = +4.0e-3 .. +9.0e-3 / token  ->  escape time ~ 110-250 tokens
+```
+
+The **untied** multi-timescale system (cell 153) agrees: `max Re μ = +9.0e-3` per token
+at the saddle against `−5.0e-3` at the attractor, i.e. unstable and stable respectively.
+Every complex pair found was **damped** — no Hopf bifurcation on this model, so the
+heterogeneous horizons (`L_ctx` 18.9 → 108.3) do not by themselves produce oscillatory
+topic drift here. The apparatus to detect one is in place if another model does.
+
+This is the **mixture saddle**: a tilted blend of the two basins, higher entropy than
+both, with the tilt as the single unstable coordinate. A second one was found between
+text 0 and text 1 (`Morse = 1`, `max Re λ = +1.010`, loop gain `0.996`) — that one is
+*marginal*, inside the ~5 % Jacobian error bar, and should be reported as such.
+
+**Robustness to the sampling budget** (cell 152 — the check that matters, since the
+product ansatz is sampled):
+
+| `n_query` | `n_fill` | rows | `\|r\|` | `H` | ESS | loop gain | max Re λ | Morse | `⟨v,φ⟩` |
+|---|---|---|---|---|---|---|---|---|---|
+| 256 | 8 | 2 250 | 8.5e-8 | 0.7750 | 2.171 | 1.444 | +1.405 | 1 | 0.9999 |
+| 256 | 32 | 8 324 | 4.1e-7 | 0.7852 | 2.193 | 1.472 | +1.432 | 1 | 0.9999 |
+| 512 | 16 | 8 568 | 1.5e-7 | 0.7856 | 2.194 | 1.470 | +1.430 | 1 | 0.9999 |
+| 256 | 64 | 16 461 | 3.0e-8 | 0.7879 | 2.199 | 1.471 | +1.429 | 1 | 0.9999 |
+| 512 | 64 | 32 981 | 1.4e-7 | 0.7913 | 2.206 | 1.480 | +1.439 | 1 | 0.9999 |
+
+Over a **15× range of sampling budget** the entropy moves 2 % (0.775 → 0.791) and the
+unstable eigenvalue 2.4 % (1.405 → 1.439), both **converging** rather than drifting; the
+Morse index and the eigenvector are identical throughout. **The saddle is not a sampling
+artifact.** Best estimate `max Re λ = 1.44 ± 0.02`; a single active-set refresh in the
+cell-151 run returned 1.71, so quote the converged sweep, not one refresh, and in either
+case the qualitative claim (`> 1`, index 1) is untouched.
+
+### (e) Time-scale separation — it holds, but NOT uniformly (cell 147)
+
+`τ_mix` is measured from `|λ(D_u G_inner)|`, the relaxation of the fast window law:
+
+| state | `τ_mix` (tokens) | worst `τ_mix / L_ctx` | loop gain | verdict |
+|---|---|---|---|---|
+| `'.'` attractor (ESS 1.0) | 0.23 | 0.012 | 0.165 | separation holds by 2 orders |
+| `' Lincoln'/'.'` saddle | 0.45 | 0.024 | 1.75 | holds |
+| anarchism attractor (ESS 12.2) | **4.20** | **0.222** | 0.625 | **marginal** |
+| text-0/`'.'` saddle (marginal) | **6.07** | **0.32** | 0.996 | **marginal** |
+
+**This is the honest answer to "does the time-separation assumption survive?".** It is
+excellent at the degenerate repetition fixed points and *degrades to marginal exactly at
+the richer states and near the marginally-stable saddle* — i.e. precisely in the regime
+worth studying. That is critical slowing down: as a mode approaches `Re λ = 1`, the frozen
+chain's own relaxation lengthens, and the two timescales stop separating. Any claim about
+a near-critical fixed point has to carry this ratio next to it. **The notebook computes
+`implied_timescales_tokens` and `L_ctx` in different lanes and never divides them; cell
+147 does.**
+
+The same cell reports the fluctuation scale: at the anarchism attractor the leading slow
+mode is `λ = +0.583` (`μ = −0.417`), giving relaxation times of 45–164 tokens per head and
+a stationary fluctuation of `√(1/L_ctx) = 0.12–0.23`. **That is the "buzzing":
+constant-step-size stochastic approximation does not converge to `m*`, it fluctuates
+around it at `O(√(1/L_ctx))`, forever. It is a prediction, not a convergence failure.**
+
+### (f) Continuation in the mean-field gain (cell 148)
+
+`λ` multiplies `far_mass`. At `λ = 0` the operator is state-independent and its unique
+fixed point is broad and disordered. Walking `λ` up (18 values, Newton-continued, spectra
+at each):
+
+| `λ` | `H` | ESS | `τ_mix` | loop gain | max Re λ |
+|---|---|---|---|---|---|
+| 0.00 | 4.177 | 65.2 | 0.93 | 0.000 | +0.000 |
+| 0.02 | 3.813 | 45.3 | 0.83 | 0.276 | +0.279 |
+| 0.05 | 3.014 | 20.4 | 0.62 | 0.346 | +0.372 |
+| 0.10 | 2.187 | 8.9 | 0.55 | 0.303 | +0.355 |
+| **0.16** | 1.765 | 5.8 | 0.62 | **0.533** | **+0.551** |
+| 0.20 | 0.902 | 2.5 | 0.62 | 0.521 | +0.512 |
+| 0.25 | 0.395 | 1.5 | 0.33 | 0.112 | +0.112 |
+| 0.50 | 0.162 | 1.2 | 0.25 | 0.045 | +0.043 |
+| 1.00 | 0.019 | 1.0 | 0.13 | 0.070 | +0.070 |
+| 1.20 | 0.019 | 1.0 | 0.12 | 0.073 | +0.073 |
+
+Three things to read off. The **order parameter collapses monotonically** (`H`: 4.18 → 0.02)
+— by `λ = 1` this branch has become a single-token repetition. The **loop gain peaks at
+≈ 0.53 near `λ = 0.16`** and then *falls back* to ≈ 0.07: the feedback **self-limits**,
+because as `m` concentrates the far field stops carrying information. And **nothing ever
+crosses `Re λ = 1`, and `λ(s)` never turns around**, out to `λ = 1.2`.
+
+So on *this* branch the ordering is a fast **crossover, not a bifurcation**, and the real
+operator at `λ = 1` sits deep in the ordered, strongly-stable regime. The other attractors
+of §7.7(c) are on branches **not reachable from `λ = 0` along this path** — which is why
+the pairwise saddle hunt of cells 150–151, and not continuation, is what produced the
+unstable fixed points here. (`arclength_continuation` is provided for the case where a
+branch *does* fold; it was not needed on this model.)
+
+### (g) A negative result worth keeping
+
+Between the `' Ital'/'ic'` and `' Ze'/'us'` attractors the straight-line coordinate
+`φ = m_A − m_B` produced **zero interior sign changes of `μ(c)`**. The two period-2 cycles
+are not connected by a saddle along that particular chord. The method finds what lies on
+the chord you choose; a negative result means "not on this line", not "no saddle".
+
+## 7.8 Caveats, in the order they will bite
+
+1. **The product ansatz is an extra approximation.** `π(window) = ∏ m(x_i)` ignores
+   correlations inside the fast window. It is the same *class* of approximation the far
+   field already makes, but it is not free: at a true fixed point the window tokens are
+   not independent. `n_fill` controls the sampling error of the ansatz, never the ansatz
+   itself — §7.7(d) prices the former, nothing here prices the latter. An order-1 (Markov)
+   ansatz, `π(x₁..x_K) = ν(x₁)∏Q(x_{i+1}|x_i)` with low-rank `Q`, is the natural next step.
+2. **The Jacobian is the σ-frozen one** (§7.6), ~5 % off, and the spread across active-set
+   refreshes is wider still (~20 % on the saddle's eigenvalue). Do not call an eigenvalue
+   within that of `Re λ = 1` decided — the text-0 saddle at `+1.010` is exactly such a case.
+3. **The active set is frozen during a solve.** That is what makes `G` smooth, but the
+   converged state is a fixed point of a *surrogate*. Always refresh and re-measure — cell
+   146 does. The SAA bar is **state-dependent and much larger at concentrated states**
+   (9e-4 at `m_init` with ESS 113, but 1.5e-2 at the saddle with ESS 2.2), because a
+   near-atomic product measure makes whole windows flip between stratification cells.
+4. **`top_p` must stay 1.0.** Nucleus filtering breaks smoothness and the straight-through
+   estimator makes the Jacobian wrong outright.
+5. **`n_layers == 1`.** `MultiTimescaleMeanFieldForwardPass` enforces it, so every claim
+   here is a one-layer claim. A unigram mean field is not a sufficient statistic deeper.
+6. **A fixed point of a bad operator is meaningless.** Cell 131's `full` row must clear
+   `jsd_baseline_context_unigram` first.
+
+## 7.9 What to do next
+
+1. **Report `τ_mix / L_ctx` beside every fixed point** — it is a one-line addition and it
+   is the number that says whether the two-timescale picture applies at that state.
+2. **Drop `K_WINDOW` to 2–3 if you keep the K-gram lane**, or keep `K = 10` in `forward`
+   and stop tracking the joint K-gram measure (this section).
+3. **Order-1 window ansatz** to price caveat 1.
+4. **Seed the saddle finder from real trajectories**: cell 81's QSD affinity matrix already
+   flags topic transitions, and a trajectory crossing a basin boundary passes near a
+   saddle. That gives initial guesses no chord has to be chosen for.
+5. **The barrier is the physics.** With `1/L_ctx` as the temperature and the saddle as the
+   transition state, `exp(−ΔΦ·L_ctx)` predicts how fast generation falls into a repetition
+   basin. The untied escape rate measured here (`+4.0e-3` per token, ≈ 250 tokens) is the
+   first number of that story.
+
+---
+
+# 8. Replication record — the fixed points that were actually found
+
+Everything needed to reproduce §7.7 from a cold kernel: the exact configuration, the
+exact procedure, the states themselves, and what they appear to mean about the model.
+The measures are archived at
+`results/meanfield_fixed_points/meanfield_fixed_points.pt` (top-400 sparse form, plus
+the unstable eigenvectors), alongside a standalone copy of the cell-143 module as
+`results/meanfield_fixed_points/meanfield_reference.py`.
+
+## 8.1 Exact configuration
+
+```python
+# --- model ------------------------------------------------------------------------
+model = HookedTransformer.from_pretrained("attn-only-1l", device="cuda:0")
+#   = NeelNanda/Attn_Only_1L512W_C4_Code, TransformerLens DEFAULTS
+#     (fold_ln=True, center_writing_weights=True, center_unembed=True).
+#     n_layers 1, n_heads 8, d_head 64, d_model 512, d_vocab 48262, n_ctx 1024.
+#   NOTE: doc 4.2 requires fold_ln=False for the K-GRAM lane. This lane does not care --
+#   MultiTimescaleMeanFieldForwardPass applies ln1.w AND ln1.b, so either load works.
+model.cfg.use_attn_result = False          # not needed here, and it costs n_heads x memory
+for p in model.parameters(): p.requires_grad = False
+torch.set_grad_enabled(True)               # the JVPs need forward-mode autograd
+
+# --- corpus -----------------------------------------------------------------------
+it = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
+ds = Dataset.from_list(list(it.take(400)))
+corpus = [t for t in ds["text"] if len(t) > 5000][:40]
+#   corpus[0] = "Anarchism", corpus[1] = "Autism", corpus[2] = "Albedo"(Italian-heavy),
+#   corpus[3] = "A", corpus[4] = "Achilles"(Zeus), corpus[5] = "Abraham Lincoln"
+
+# --- timescale profiling (cell 129, with N_PROBE reduced from 1024 to 256) ---------
+K_WINDOW, T_STAR      = 10, 800
+PROFILE_D_MAX, FIT_D_MAX = 512, 256
+N_PROBE, PROBE_SEED   = 256, 0
+# fitted, then clamped into [K+2, T_STAR] -- NO head was clamped:
+L_ctx_used = [68.2, 26.9, 18.9, 75.2, 108.3, 26.3, 66.6, 26.1]     # heads 0..7
+gamma      = [0.98533, 0.96285, 0.94716, 0.98670, 0.99076, 0.96200, 0.98498, 0.96168]
+mtmf_full  = MultiTimescaleMeanFieldForwardPass(
+    model, L_ctx=L_ctx_used, active_heads=None, K=K_WINDOW,
+    query_position_offset=T_STAR, temperature=1.0, top_p=1.0)
+
+# --- the reduction (cell 144) ------------------------------------------------------
+rmf = ReducedMeanFieldOperator(mtmf_full, n_query=256, n_fill=8,
+                               ctx_top_n=2048, query_chunk=512, far_scale=1.0, seed=0)
+#   -> 1995 query rows; coverage (query, context) = (0.9952, 1.0000)
+
+# --- initial conditions (cell 144/149) ---------------------------------------------
+POSITION  = 900
+estimator = DiscountedUnigramContextEstimator(window=10)
+init_head = argmax(L_ctx) = 4          # gamma 0.99076, L_ctx 108.3
+#   realized far_mass matched the saturated 1/(1-gamma) to 0.1 on every head, so
+#   POSITION = 900 is comfortably inside the autonomous regime (doc 6.2, MIN_POSITION).
+```
+
+`N_PROBE = 256` instead of cell 129's 1024 is the only deviation from the notebook's own
+profiling defaults; γ is a median over probe tokens and is insensitive to it (doc 6.1).
+
+## 8.2 The procedure
+
+| step | cell | call | settings |
+|---|---|---|---|
+| 1. attractors | 149 | `picard` then `newton_krylov` | `n_steps=150, alpha=0.15, refresh_every=25`; then `max_newton=8, tol=1e-10, refresh_every=0` |
+| 2. reaction coordinate | 150 | `mu_scan` | `φ = (m_A − m_B)/‖·‖`, 28 values of `c` from `c_B` to `c_A`, `max_newton=14, gmres_maxiter=40, tol=1e-9`, warm-started |
+| 3. bracket | 150 | sign changes of `μ(c)` | keep the one with `dμ/dc > 0` |
+| 4. bisect | 151 | `solve_constrained` | 14 bisections; **stalls at `|μ| ≈ 2e-2`** (the constrained branch folds in `c`) |
+| 5. **polish** | 151 | `newton_krylov` | `max_newton=16, tol=1e-9, refresh_every=0, gmres_maxiter=60, gmres_tol=1e-4` → `|r| ≈ 4e-9` |
+| 6. classify | 151 | `split_spectra` | `k=8`, `n_neumann=8` |
+| 7. validate | 152 | re-solve at `n_fill ∈ {8, 32}`, `n_query ∈ {256, 512}` | Morse index and eigenvector must not move |
+| 8. untied | 153 | `tied_reduced` / `untied_reduced` | dense projection on a ~26-vector basis |
+
+Step 5 is not optional: bisection alone leaves `|r| ≈ 2e-2`, two orders above the noise
+bar, and the spectra computed there are wrong by ~20 %. Step 4 → 5 is also the cleanest
+demonstration of the section's central claim: **JFNK takes `|r|` from 1.6e-2 to 4.2e-9 in
+16 steps and moves the state by `JSD = 8.1e-4`, i.e. it converges to an index-1 saddle
+and stays on it.**
+
+Runtimes on one Quadro RTX 5000 (16 GB): cell 146 ≈ 50 s, 147 ≈ 200 s, 148 ≈ 20 min,
+149 ≈ 5–6 min, 150 ≈ 8 min, 151 ≈ 8 min, 152 ≈ 25 min. Peak VRAM ≈ 2 GB.
+
+## 8.3 The stable fixed points (six initial conditions, one operator)
+
+All reached `|r| ≤ 1e-7`. `H` in nats, ESS `= e^H`.
+
+| text | article | fixed point (top of `m*`) | `H` | ESS | `h` | `K_max` |
+|---|---|---|---|---|---|---|
+| 0 | Anarchism | `'ists' .289  ' anarch' .277  ',' .186  ' and' .056  '.' .039` | 2.499 | 12.2 | 1.379 | 6.0 |
+| 1 | Autism | `'.' .995  '._' .005` | 0.033 | 1.03 | 0.031 | 300 |
+| 2 | Albedo | `'ic' .484  ' Ital' .480` | 0.996 | 2.71 | 0.298 | 29 |
+| 3 | A | `' Al' 1.000` | 0.004 | 1.00 | 0.004 | 2124 |
+| 4 | Achilles | `'us' .482  ' Ze' .477` | 1.006 | 2.73 | 0.308 | 28 |
+| 5 | Abraham Lincoln | `' Lincoln' .899  '.' .027` | 0.736 | 2.09 | 0.693 | 13.5 |
+
+Every initial condition was a real prompt with `H ≈ 4.6–4.8`, `h ≈ 4.3–5.4`. **The
+dynamics loses 2–5 nats of entropy on the way to its fixed point** — `JSD(π₀, m*)` runs
+0.42–0.65.
+
+Three kinds of attractor appear:
+
+* **fixed-point loops** (texts 1, 3): one token at mass ≈ 1. `' Al'` and `'.'`.
+* **period-2 cycles** (texts 2, 4): `' Ital'→'ic'→' Ital'` and `' Ze'→'us'→' Ze'`. A
+  2-cycle shows up in a *mean field* as two tokens at ≈ ½ each, `H ≈ ln 2 = 0.693`. The
+  mean field cannot distinguish a 2-cycle from a genuine 50/50 mixture — which is a real
+  limitation of a unigram state, and one the K-gram lane would not have.
+* **a small recurrent set** (text 0): five tokens forming the phrase fragment
+  `' anarch' 'ists' ',' ' and'` — a stuttering list construction, `H = 2.50`.
+
+## 8.4 The unstable fixed points
+
+### Saddle A — `' Lincoln'` ↔ `'.'` (the one to trust)
+
+Found between attractor 5 and attractor 1. Converged by bisect + JFNK to `|r| = 4.2e-9`,
+and reproduced independently on a second GPU with a fresh active set (`H = 0.8092` vs
+`0.8095`).
+
+```
+m*        ' Lincoln' 0.784 | '.' 0.174 | ',' 0.007 | ' and' 0.006 | ' 1' 0.003
+H = 0.809 nats, ESS = 2.25            ABOVE both neighbours (0.735 and 0.033)
+JSD to A = 0.037,  to B = 0.446       it sits close to the shallow basin, far from the deep one
+
+MORSE INDEX      1                    exactly one unstable direction
+max Re lambda    +1.44 +- 0.02        converged over a 15x sampling-budget sweep
+                                      (one refresh in cell 151 gave 1.71 -- quote the sweep)
+loop gain        1.44 .. 1.48         > 1, as coexistence of two attractors requires
+lambda(slaved)   1.639, 0.114, 0.077, 0.046+-0.012j, 0.042      -- ONE mode above 1, rest tiny
+tau_mix          0.40 - 0.48 tokens   worst tau_mix/L_ctx = 0.021 -> separation holds
+untied growth    Re mu = +4.0e-3 .. +9.0e-3 / token -> escape time ~ 110-250 tokens
+                 (untied attractor for contrast: Re mu = -5.0e-3, stable)
+                 all complex pairs DAMPED -> no Hopf, no limit cycle on this model
+
+unstable eigenvector (|<v, phi>| = 0.9996 -- it IS the A-B tilt)
+    '.'         +0.716
+    ' Lincoln'  -0.698
+    ','         +0.005      everything else below 0.004
+```
+
+Robustness (cell 152): over a **15× range of sampling budget** (2 250 → 32 981 query
+rows) `H` moves 2 % and `max Re λ` 2.4 %, both converging; Morse index stays 1 and
+`⟨v, φ⟩` stays 0.9999 throughout.
+
+### Saddle B — the anarchism basin ↔ `'.'` (marginal, report as such)
+
+Found between attractor 0 and attractor 1, at `|r| = 6.8e-3` (bisection only — it was
+**not** put through the JFNK polish, so it is a *near*-saddle and its eigenvalues carry
+the 20 % bar of §7.8.2).
+
+```
+m*        'ists' .301 | ' anarch' .289 | ',' .121 | '.' .119 | ' and' .035
+H = 2.438 nats, ESS = 11.4            BELOW attractor 0 (2.499), far above attractor 1 (0.033)
+MORSE INDEX      1
+max Re lambda    +1.010                MARGINAL -- inside the ~5% Jacobian error bar
+loop gain        0.996                 also marginal
+tau_mix          6.07 tokens           worst tau_mix/L_ctx = 0.32  -> SEPARATION IS MARGINAL
+untied growth    Re mu = +1.7e-4 per token -> escape time ~ 6000 tokens
+
+unstable eigenvector
+    '.'         -0.808
+    ','         +0.572
+    ' and'      +0.121
+    ' anarch'   -0.049
+    'ists'      -0.047
+```
+
+### A negative result
+
+Between the two period-2 cycles (`' Ital'/'ic'` and `' Ze'/'us'`) the chord
+`φ = m_A − m_B` gave **zero interior sign changes of `μ(c)`**. The method finds what lies
+on the chord you pick; this says "no saddle on this line", not "no saddle".
+
+## 8.5 Interpretation — what these states say about the model
+
+**1. There is a universal sink, and it is `'.'`.** Attractor 1 (`'.'` at 0.995) is reached
+from an unrelated article, and `'.'` is the dominant component of the unstable
+eigenvector of *both* saddles (+0.716 in A, −0.808 in B). On this model the terminal
+punctuation token is the gateway to a global absorbing basin: once the far field is
+dominated by `'.'`, the mean field makes `'.'` the most likely continuation, and the loop
+closes. Every saddle found is the boundary between *staying in a topic* and *falling into
+the punctuation sink*. That is a mechanistic statement of neural text degeneration inside
+this abstraction.
+
+**2. The saddles are mixture states, and the unstable coordinate is the tilt.** Saddle A
+is literally `0.78·(Lincoln basin) + 0.17·(period basin)`, its entropy is higher than
+either neighbour, and its unstable eigenvector aligns with `m_A − m_B` to four decimals.
+This is the Curie–Weiss picture: the transition state is the blend, and the order
+parameter is how far you have tipped. It also means such a saddle is exactly the kind of
+object the K-gram parameterization is *least* able to hold (cell 145: higher entropy
+needs exponentially more explicit states).
+
+**3. Saddle B is a punctuation decision.** Its unstable direction is `','` (+0.572)
+against `'.'` (−0.808), with the content tokens `' anarch'/'ists'` barely participating.
+Read as dynamics: inside the anarchism basin the model is balanced between *continuing
+the clause* (comma, stay in the list construction) and *ending the sentence* (period, and
+from there the sink). The saddle is a **syntactic branch point**, not a semantic one, and
+it is marginally unstable — `max Re λ = 1.010`, escape time ≈ 6000 tokens. A near-neutral
+direction like that is precisely what "the model dithers between continuing and stopping"
+would look like as a dynamical statement.
+
+**4. The barrier is asymmetric, and that predicts which way generation falls.** Saddle A
+sits at `JSD = 0.037` from the `' Lincoln'` attractor but `0.446` from the `'.'`
+attractor. The `' Lincoln'` basin is *shallow* — the transition state is almost on top of
+it — while the `'.'` basin is deep and wide. With `1/L_ctx` as the temperature and escape
+going as `exp(−ΔΦ·L_ctx)`, that asymmetry says: a repeated proper noun is a metastable
+state that leaks quickly into terminal punctuation, and the punctuation basin does not
+leak back. The measured untied escape rate, `+4.0e-3 … +9.0e-3` per token (≈ 110–250 tokens), is
+the first quantitative version of that claim.
+
+**5. Time-scale separation is good where nothing interesting happens and marginal where
+it does.** `τ_mix/L_ctx` is 0.012 at the `'.'` attractor, 0.021 at saddle A, 0.22 at the
+anarchism attractor and 0.32 at saddle B. The separation degrades exactly as the state
+gets richer and as `Re λ` approaches 1 — critical slowing down. So the two-timescale
+picture is *quantitatively* sound at the degenerate fixed points and only *qualitatively*
+sound at the interesting ones. Any claim about a near-critical state has to carry that
+ratio next to it.
+
+**6. The single feedback loop is weak except near a saddle.** `loop_gain` is 0.17 at the
+`'.'` attractor, 0.63 at the anarchism attractor, and 1.4–1.75 at saddle A. It has to
+exceed 1 somewhere — a globally contracting map has a unique fixed point — and the only
+places it does are the basin boundaries. This is why continuation from `λ = 0` (cell 148)
+never finds a bifurcation: along that branch the gain peaks at ≈ 0.5–0.66 and then
+*self-limits* as the state concentrates. The multiple basins are not created by a
+bifurcation of the disordered branch; they are separate branches, and pairwise saddle
+hunting rather than continuation is what reaches them.
+
+**7. Caveat that colours all of the above.** This is a 1-layer, attention-only model, and
+a unigram mean field with an i.i.d.-window ansatz. The `'.'` sink and the comma/period
+branch point are real properties *of this abstraction*; whether they survive into the
+concrete model is what cell 131's ablation table is for, and whether they survive a
+richer window ansatz is open (§7.8.1).
