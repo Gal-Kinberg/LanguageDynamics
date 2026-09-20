@@ -263,6 +263,8 @@ MultiTimescaleMeanFieldForwardPass(model, L_ctx, ...)      [cell 108]   ← ONE 
 ├── FIXED-POINT API  (cell 137)
 │   ├── kgram_to_unigram(vals, keys, marginal)      → the mean field, differentiably
 │   ├── power_iteration_step(...)                   → one ν → νP_π step on K-grams
+│   │     └── POST-AGGREGATION pruning: suffix-group → dense [N_s, |V|] flux table
+│   │         → global top-N. `prune_mode="pre"` restores the old per-query top-k.
 │   └── stationary(ν, keys, N, pruning_K, M, ...)   ← drop-in for compute_stationary_distribution
 │
 └── BENCHMARK API  (cells 131, 135)
@@ -422,12 +424,43 @@ signature** — see §4.3.
 `single_power_iteration_step` itself is unchanged in logic between versions:
 `topk` per query → shift keys left and append the new token → flatten →
 `torch.unique(dim=0)` + `scatter_add_` (differentiable aggregation of converging paths) →
-global `topk(N)` → renormalize. `compute_stationary_distribution` wraps each of the `M`
+global `topk(N)` → renormalize. **Note that this lane still prunes *before* it aggregates**,
+which is the bias §2.5.1 describes; `MTMF.power_iteration_step` (§2.11.9) no longer does.
+`compute_stationary_distribution` wraps each of the `M`
 steps in `torch.utils.checkpoint(..., use_reentrant=False)`; `use_reentrant=False` is
 required so autograd can route gradients through the float tensors while ignoring the
 integer key tensors.
 
 ### 2.5 Support discovery — power iteration vs. Dijkstra (cell 11)
+
+#### 2.5.1 Pre- vs. post-aggregation pruning — the distinction that runs through everything
+
+Every sparse `π ← πP` step in this notebook has to throw states away, and *when* it throws
+them away changes which fixed point you find.
+
+* **Pre-aggregation (per query).** Take `topk(K_PRUNING)` along each query's own row of
+  `[N_q, |V|]` and only then sum the converging paths. A successor that is the 3rd-best
+  continuation of two hundred different queries — and therefore carries more mass than any
+  of their individual favourites — is **never even constructed**. The discovered support is
+  biased toward low-entropy, single-parent paths.
+* **Post-aggregation (the guillotine).** Two queries land on the same successor K-gram iff
+  they share the `(K−1)`-**suffix** *and* emit the same next token. So group the queries by
+  suffix, accumulate `π(q)·P(v|q)` into a dense `[N_suffix, |V|]` table — an **exact**
+  inventory of the flux onto every reachable successor — and prune only after that. Ranking
+  is then by true total mass.
+
+`MetastableKGramEngine.run_pruned_power_iteration` has always done the second
+(`epsilon_power_method` is an absolute floor on the *aggregated* flux, applied per
+`suffix_chunk_size` block). `MTMF.power_iteration_step` now does it too (§2.11.9).
+`single_power_iteration_step` — the older `abstract_forward_pass` lane — still does the
+first; it has not been changed.
+
+The accumulator is no bigger than the `[N_q, |V|]` matrix the forward pass already
+returned (`N_suffix ≤ N_q`), so post-aggregation is not the more expensive option. It is
+usually cheaper, because it replaces a `torch.unique` over `N_q × K_PRUNING` key rows with
+integer div/mod on a `topk` result.
+
+#### 2.5.2 The two engines
 
 `MetastableKGramEngine` offers two ways to find the closed K-gram support. They answer
 different questions and are **not** interchangeable.
@@ -1111,6 +1144,51 @@ limit by hand — zero `W_pos`, one head, `gamma=1.0`, `K=1`, realized `far_mass
 against the concrete model with the other heads ablated — before trusting anything
 downstream. Adding that as a permanent cell would be a cheap, high-value contribution.
 
+#### 2.11.9 `power_iteration_step` / `stationary` — the fixed-point API
+
+```python
+power_iteration_step(curr_vals, curr_keys, context_vals, context_keys, N,
+                     pruning_K=None, far_mass=None,
+                     prune_mode="post", epsilon_prune=0.0, suffix_chunk_size=None)
+
+stationary(nu_vals, nu_keys, N, pruning_K=None, M=1,
+           context_vals=None, context_keys=None, far_mass=None,
+           marginal="last", use_checkpoint=True,
+           prune_mode="post", epsilon_prune=0.0, suffix_chunk_size=None)
+```
+
+One step of `ν → νP_π` on the K-gram state space, and `M` of them with the mean field
+frozen outside the loop. `stationary` passes the pruning arguments straight through, so
+**the exploration and the gradient phases prune by the same rule** — the point of having
+them share a code path at all.
+
+`prune_mode="post"` (the default) is the post-aggregation guillotine of §2.5.1:
+
+1. `forward` → `P_active [N_q, |V|]`; `flux = ν(q)·P(v|q)`.
+2. Group the queries by their `(K−1)`-suffix (`torch.unique(curr_keys[:, 1:], dim=0)`;
+   `K == 1` is handled as one degenerate zero-width suffix).
+3. `scatter_add` the flux into a dense `[N_suffix, |V|]` accumulator — **exact**: every
+   parent of every successor has contributed before anything is ranked.
+4. Global `topk(N)` over the accumulator, then integer div/mod recovers `(suffix, token)`.
+   Those keys are unique by construction, so no coalescing pass is needed.
+5. Renormalize.
+
+The optional knobs:
+
+| Argument | Meaning |
+|---|---|
+| `pruning_K` | A cap on successors kept **per suffix row**, applied *after* the sum. `None` = off; `N` does all the pruning. It exists only to bound the candidate set when `N_suffix × \|V\|` is too large to `topk` in one shot — it never ranks by a single parent's opinion. Under `prune_mode="pre"` it reverts to the legacy per-query top-k. |
+| `epsilon_prune` | Absolute flux floor on aggregated successors — the engine's `epsilon_power_method`. `0.0` = off. Raises if it wipes out every successor. |
+| `suffix_chunk_size` | Process unique suffixes in blocks so the accumulator stays bounded. Each block keeps its own top-`N` and the global top-`N` is taken over the union, which is *identical* to the unchunked result (verified for chunk sizes 1…N_suffix). |
+| `prune_mode="pre"` | The old rule, kept so the cost of the old approximation can be measured. Do not use it for new results. |
+
+Gradients survive all of it: the `scatter_add` and the `topk` gather are both
+differentiable in `curr_vals`, and `stationary` still wraps each step in
+`torch.utils.checkpoint(..., use_reentrant=False)` so autograd routes around the integer
+keys. Note that the positional argument order inside that `checkpoint` call changed when
+`prune_mode`/`epsilon_prune`/`suffix_chunk_size` were added — if you add another argument,
+update both call sites in `stationary`.
+
 ---
 ### 2.12 `DiscountedUnigramContextEstimator` (cell 108)
 
@@ -1280,6 +1358,7 @@ out over heads, because every head is in play at once.
 | Mean field | the state itself | the state's **unigram marginal** via `kgram_to_unigram` |
 | Initial condition | `pi_from_context` — the raw context histogram | `DiscountedUnigramContextEstimator`, lifted to K-grams |
 | Exploration | none | no-grad power iteration of the same operator |
+| Pruning inside `πP` | per-query top-k | **post-aggregation** over the `(K−1)`-suffix table (§2.5.1) |
 | Parallelism | one head per GPU, `joblib`/`loky` | single process, single GPU |
 | Result key | `wide_results[head][i]` | `wide_mtmf_results[i]` (flat list) |
 
@@ -1298,9 +1377,11 @@ exploration and gradient phases explore different dynamics — precisely the dri
 exists to prevent. `mtmf.stationary(...)` under `torch.no_grad()` is the exploration phase,
 and it is the same code path the gradient phase uses.
 
-The cost is real and worth naming: the engine prunes on **fully aggregated flux**, so
-states reached by many weak paths survive (§2.5). A top-k rollout does not. If the support
-looks anaemic, that trade is the first place to look.
+That used to cost something: the engine prunes on **fully aggregated flux**, so states
+reached by many weak paths survive, while the rollout's per-query top-k did not. **That
+gap is closed** — `MTMF.power_iteration_step` now uses the same post-aggregation guillotine
+(§2.5.1, §2.11.9), in both phases. `PRUNE_MODE = "pre"` in cell 137 restores the old
+behaviour if you want to price it; if a run's support looks anaemic, compare the two.
 
 #### 2.14.2 What `π` means here
 
@@ -1349,6 +1430,8 @@ PHASE 2  gradient       pi_logits = log π ; π = softmax(pi_logits)
                         mean field = kgram_to_unigram(π over the FULL union)
                         queries    = top-N_ACTIVE of π, renormalized
                         πP         = mtmf.stationary(..., M = M_ITERATIONS, checkpointed)
+                                     PRUNE_MODE = "post": suffix-group → dense
+                                     [N_s, |V|] flux table → global top-N_OUTPUT
                         loss       = LOSS_SCALE · compute_aligned_jsd(π, πP)
 PHASE 3  natural grad   Sherman–Morrison on the simplex, λ = 1e-10, clip to 1.0
 PHASE 4  prune/migrate  top-N_TRACKING, drop dead, renormalize
@@ -2061,7 +2144,7 @@ optimization through `mtmf_full`; §6.2–§6.6 are the optimization cell's own 
 | seeing `top_mass` well below 1 | `N_ACTIVE` ↑ |
 | seeing the loss plateau above ~1e-2 | `N_OUTPUT` ↑, then `N_ITERATIONS` ↑, then `LR_MAX` ↓ |
 | seeing the support grow without bound | `N_TRACKING` ↓ or `EXPLORE_N` ↓ |
-| out of VRAM | `QUERY_CHUNK_SIZE` ↓ first, then `K_PRUNING` ↓, then `CTX_TOP_N` set |
+| out of VRAM | `QUERY_CHUNK_SIZE` ↓ first, then `SUFFIX_CHUNK_SIZE` set, then `CTX_TOP_N` set |
 | unsure the fixed point means anything | go back to cell 131's ablation table, not to these knobs |
 
 ---
@@ -2266,20 +2349,46 @@ faithfully it is evaluated, and every one has a printed diagnostic.
   panel 4) shows a cliff exactly at rank `N_OUTPUT`. That cliff is the parameter, not the
   physics.
 
-#### `K_PRUNING` — successors kept per query
+#### `PRUNE_MODE` — *when* states are thrown away
 
-* **Controls** how many next-tokens survive per query inside `power_iteration_step`
-  (`topk` over the `[N_q, |V|]` transition rows, before the key shift).
-* **Effect.** Bounds the branching factor of the discovered dynamics. Too small and the
-  support can only ever grow along the model's most likely continuations, which biases the
-  measure toward low-entropy paths. The intermediate tensors are
-  `N_ACTIVE × K_PRUNING × K` integers, so it is the main *memory* term of the power
-  iteration.
-* **Tuning.** 512 is the notebook default. Compare it against the model's actual branching
-  factor at these positions — cell 101 (`measure_branching_factor`) computes it. If the
-  typical nucleus is 50 tokens wide, 512 is generous and can be lowered for speed.
-* **Diagnosis.** Raise `K_PRUNING` 2× and re-run one text. If the final loss or the top
-  K-grams move, it was binding.
+* **Controls** whether `power_iteration_step` prunes before or after summing the flux from
+  all parents onto each successor. `"post"` (default) is the correct rule; `"pre"` is the
+  old per-query top-k. See §2.5.1 for the distinction and §2.11.9 for the implementation.
+* **Effect.** This is a change to *which fixed point you find*, not to convergence speed.
+  Under `"pre"`, a K-gram that collects a large total mass from many queries — while being
+  nobody's individual top-`K_PRUNING` continuation — is never constructed, so the search
+  is biased toward low-entropy, single-parent paths. Under `"post"` the ranking is by true
+  total mass and such states survive.
+* **Tuning.** Leave it `"post"`. Set `"pre"` only to reproduce a pre-change run or to
+  measure what the old approximation cost.
+* **Diagnosis.** Run one text both ways. A support that gains broad, high-branching-factor
+  K-grams under `"post"` is the expected result; if the two agree, the old rule was not
+  binding on that operator.
+
+#### `K_PRUNING` — optional per-suffix cap (now `None`)
+
+* **Controls** how many successors survive per **suffix row** under `"post"` — applied
+  *after* the aggregation, so it still ranks by true total flux. `None` (the new default)
+  means no per-row cap at all: `N_OUTPUT` / `EXPLORE_N` do all the pruning. Under
+  `PRUNE_MODE = "pre"` it reverts to its old meaning, successors kept per *query*.
+* **Effect.** Under `"post"` it is a pure memory/speed lever on the `topk` that follows the
+  `[N_suffix, |V|]` accumulator, not a change to the physics — unless you set it below the
+  model's real branching factor, in which case it truncates the aggregated table too.
+  Compare against cell 101 (`measure_branching_factor`) before setting it.
+* **Tuning.** Leave it `None`. `SUFFIX_CHUNK_SIZE` is the better memory lever, because it
+  is exactly equivalent to the unchunked result.
+* **Diagnosis.** Set it, raise it 2×, re-run one text. If the final loss or the top K-grams
+  move, it was binding and should go back to `None`.
+
+#### `EPSILON_PRUNE` / `SUFFIX_CHUNK_SIZE`
+
+* `EPSILON_PRUNE` is an absolute floor on **aggregated** successor flux — the engine's
+  `epsilon_power_method`, transplanted. `0.0` (default) is off. It is a cleaner prune than
+  a rank cut when the branching factor varies a lot between states, because it keeps a
+  constant *mass* resolution rather than a constant *count*.
+* `SUFFIX_CHUNK_SIZE` bounds the dense `[N_suffix, |V|]` accumulator by processing unique
+  suffixes in blocks. Each block keeps its own top-`N` and the global top-`N` is taken over
+  the union, so the result is bit-identical to the unchunked one; only peak VRAM changes.
 
 #### `N_TRACKING` — cap on `|support(π)|`
 
@@ -2291,7 +2400,9 @@ faithfully it is evaluated, and every one has a printed diagnostic.
   can act on them; too large and you pay for tens of thousands of states carrying `2·eps`.
 * **Tuning.** 8192 is the default here. Cell 117 uses `d_vocab // 4` for a *unigram* state
   space; that is far too generous for K-grams, where almost all states have negligible
-  mass. Set it a few times `N_ACTIVE`.
+  mass. Set it a few times `N_ACTIVE`. It must be an **int**: `torch.topk(k=min(N_TRACKING,
+  N_union))` raises on a float `k`, and cell 137's `model.cfg.d_vocab/4` only stayed hidden
+  while `N_union` happened to be the smaller of the two.
 * **Diagnosis.** `n_union_history` (cell 140, panel 2). If it saturates flat at
   `N_TRACKING + EXPLORE_N`, you are pruning every iteration and the cap is binding — check
   that the pruned mass is negligible by comparing `n_states_final` with the rank–mass
@@ -2504,7 +2615,8 @@ decoded K-gram labels are truncated. None of them touches the data.
 | final π ≈ initial π, loss barely moved | the operator is barely state-dependent: check `L_ctx` (§6.1) before blaming the optimizer |
 | every run converges to the same π regardless of text | either a genuine global attractor or `N_OUTPUT` is so small that only the operator's own top states survive — check the rank–mass cliff |
 | OOM in `_forward_chunk` | `QUERY_CHUNK_SIZE` ↓ |
-| OOM in `power_iteration_step` | `K_PRUNING` ↓ or `N_ACTIVE` ↓ |
+| OOM in `power_iteration_step` | `SUFFIX_CHUNK_SIZE` set (exact), then `N_ACTIVE` ↓ |
+| support suddenly much broader than before a re-run | expected: `PRUNE_MODE = "post"` keeps diffusely-supported states the old per-query top-k dropped (§2.5.1) |
 
 ### 6.9 Cost model
 
@@ -2515,8 +2627,9 @@ exploration :  EXPLORE_M × [ forward(N_ACTIVE queries) + topk(N_ACTIVE × |V|) 
 gradient    :  M_ITERATIONS × forward(N_ACTIVE queries) × ~2                          checkpointed
                                                           ^ recomputed in backward
 forward mem :  H × min(N_ACTIVE, QUERY_CHUNK_SIZE) × N_c × 4 bytes × O(1) intermediates
-power it.mem:  N_ACTIVE × |V| × 4 bytes  (the dense transition rows before topk)
-             + N_ACTIVE × K_PRUNING × K × 8 bytes  (the shifted keys, before unique)
+power it.mem:  N_ACTIVE × |V| × 4 bytes  (the dense transition rows)
+             + N_suffix × |V| × 4 bytes  (the aggregated flux table, N_suffix <= N_ACTIVE;
+                                          SUFFIX_CHUNK_SIZE bounds this term exactly)
 union merge :  torch.unique over [(N_TRACKING + EXPLORE_N), K]
 ```
 
