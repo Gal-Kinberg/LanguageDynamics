@@ -1118,6 +1118,7 @@ the optimization through `W_far_h` alone. This is why §2.14's wide optimization
 | `frozen_sigma` | RMS of a typical embedding | The scalar for `layernorm_mode="frozen"`. |
 | `mask_dead_local` | `True` | Wipe BOS/PAD positions out of the fast window so the sink is not double-counted. |
 | `ablate_sink` | `False` | Drop the BOS sink entirely — no key mass in `Z`, no value in the output. The JSD gap to `full` is how much of the forward pass the sink carries. |
+| `ablate_far_field` | `False` | Drop the **mean-field block** entirely — no far-field mass in `Z`, no far-field value in the output — leaving the exact window and the exact sink to renormalize over themselves. This is the row that prices **the approximation itself** (§2.13.1). Exactly equivalent to driving `far_mass → 0`, and verified as such to 0.0 max abs difference. With it on, `π`, `γ` and `far_mass` are inert: `forward` no longer needs a `far_mass` even at `gamma == 1.0`, and there is no gradient w.r.t. `context_vals`. |
 | `query_chunk_size` | `None` | Split the query batch when forming the `[H, N_q, N_c]` score tensor. `None` = one shot. |
 | `temperature`, `top_p` | `1.0`, `1.0` | Sampling transform on the returned probabilities, with the same straight-through estimator as §2.1. |
 | `context_estimator` | `DiscountedUnigramContextEstimator(window=K)` | Used by `predict` only. |
@@ -1294,12 +1295,26 @@ contribution:
 | `no QK cross terms` | `local_cross_terms=False` | the two cross terms the old `M_local` dropped |
 | `no far pos. value` | `far_positional_value=False` | the mean positional embedding in the far-field value |
 | `no BOS sink` | `ablate_sink=True` | how much of the forward pass the sink carries |
+| `no far field (window+sink only)` | `ablate_far_field=True` | **the approximation itself** — see below |
 | `true query position` | `use_real_query_position=True` | the cost of the dummy `t*` |
 | `uniform L_ctx` | `L_ctx=L_ctx_used.mean()` | **whether per-head timescales matter at all** |
 | `K=1` / `K=8` / `K=16` | `K=…` | where the window/mean-field split should sit |
 
 The control `jsd_baseline_context_unigram` (the raw context histogram, no model at all)
 comes free with every run and is drawn as the line every bar must clear.
+
+> **`no far field` is not one ingredient among the others — it is the reference the whole
+> abstraction is measured against.** The fast window and the BOS sink are computed
+> *exactly* (§2.11.1); the mean field is the only approximated term in the partition
+> function. Ablating it therefore leaves an exact but **truncated** forward pass: the last
+> `K` tokens plus BOS, nothing else. The gap between that bar and `full` is the entire
+> value of the mean field at this `K`. Without it, the `K=8` / `K=16` rows are unreadable
+> — a large enough `K` makes the abstraction look good for the trivial reason that it has
+> stopped approximating anything, and "the JSD is small" would mean only "the context
+> beyond `K` did not matter here". Expect the bar to be large: `W_far_h = E_pos_h(K)·Z_far_h`
+> is most of the attention mass for a long-horizon head. It is drawn in its own warm hue
+> for that reason. If it lands near `full`, the mean field is decoration on this model and
+> the honest abstraction is a plain `K`-token window.
 
 > **Read the `uniform L_ctx` row first.** If it matches `full`, the multi-timescale story
 > is not carrying its weight on this model and the whole per-head apparatus is decoration.
