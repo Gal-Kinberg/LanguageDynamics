@@ -73,6 +73,10 @@ attention logits as a function of relative distance `d`. These statistics feed t
   └─ [115] Example run + ablation table (measured JSD ≈ 1.6e-12)
 [116–121] EXACT SINGLE-SEMANTIC-HEAD FIXED-POINT SEARCH — the cell-68 loop driven by the
           exact parameterization, with `MetastableKGramEngine` as the exploration phase
+[109–112] SEMANTIC FIXED-POINT METASTABILITY — `SemanticUnigramMSM`  (§2.16)
+  ├─ [110] The class + reporting/plotting helpers + `load_semantic_analysis_model`
+  ├─ [111] Run the pipeline over `wide_results`, one-line-per-fixed-point summary
+  └─ [112] Per-fixed-point report, 4-panel diagnostic, induced-chain graph
 [122–127] Jacobian / linear-stability analysis of a found fixed point
 [128–131] FULL MULTI-HEAD, POSITION-ENABLED ABSTRACTION  (§2.11–2.13)
   ├─ [129] Timescale profiling: measure E_pos(d) per head, fit γ, build `mtmf_full`
@@ -84,10 +88,14 @@ attention logits as a function of relative distance `d`. These statistics feed t
   └─ [140] Single-run diagnostics: 8-panel figure + the headline numbers
 ```
 
-Cell numbering is as of this revision of the notebook (141 cells). Cells 88–106 (the
-token-level wide optimization) are only sketched here; cells 107–111 are documented in
-full in §2.9 and §5, cells 112–115 in §2.10, cells 128–135 in §2.11–§2.13, and cells
-136–140 in §2.14 and §6.
+Cell numbering above is as of the revision this guide was written against (141 cells) and
+is now **stale**: the notebook currently has 166 cells. In particular §2.15's "cells 88–94"
+are cells 88–98, and the four `SemanticUnigramMSM` cells (§2.16) were inserted at 109–112,
+shifting everything after them by +4. Cells 88–106 (the token-level wide optimization) are
+only sketched here; the approximation-quality benchmark is documented in full in §2.9 and
+§5, the exact 1-layer forward pass in §2.10, the full abstraction in §2.11–§2.13, and the
+wide multi-timescale lane in §2.14 and §6. **Locate cells by their header comment, not by
+their index.**
 
 ### 1.2 Dependency tree — Pipeline C (K-gram / multi-layer, the current one)
 
@@ -1616,6 +1624,282 @@ spread π, so a `chunk_size` that was ample for one head may not be for eight.
 
 ---
 
+### 2.16 Semantic fixed-point metastability — `SemanticUnigramMSM` (cells 109–112)
+
+The single source of truth for *analysing* a fixed point that §2.15 *found*. Everything in
+§2.15 answers "does `JSD(π, πP)` go to zero?"; this section answers "what kind of object is
+the π that got there?" — is it closed, how long does it live, how many metastable basins
+does it contain, is π its own quasi-stationary distribution, and is the mixture stable or a
+saddle.
+
+It replaces the ad-hoc combination of `jacobian_stability_analysis` (cell 9),
+`extract_substochastic_matrix` + `MetastableMSMAnalyzer` (cell 11, K-gram-shaped) and
+`measure_branching_factor` for this lane. It is **unigram-only and semantic-only** by
+design: one layer, any head group, no positional embeddings, exact forward pass.
+
+#### 2.16.1 The four new cells
+
+| Cell | Contents |
+|---|---|
+| 109 | Markdown header for the section |
+| 110 | `SemanticUnigramMSM`, `print_fixed_point_report`, `plot_fixed_point_report`, `plot_induced_chain_graph`, `load_semantic_analysis_model`, `analyze_wide_fixed_points`, `summarize_fixed_point_analyses` |
+| 111 | Runs the full pipeline over `wide_results` and prints the one-line-per-fixed-point summary |
+| 112 | Per-fixed-point textual report + the four-panel diagnostic + the induced-chain graph |
+
+Cell 110 depends only on cell 3's imports plus `networkx` (imported lazily inside the
+plotting function) and `deeptime` (already required by `MetastableMSMAnalyzer`). It does
+**not** depend on cell 9, cell 10 or cell 11 — the forward pass is re-derived inside the
+class so that there is exactly one definition of `P_π` in this lane.
+
+#### 2.16.2 ⚠ Two traps this class exists to catch
+
+**(a) `fold_ln`.** Cell 15 loads the interactive `model` with the TransformerLens default
+`fold_ln=True`. `_wide_optimization_worker` (cell 89) loads with **`fold_ln=False`**.
+Folding LayerNorm moves `ln1.w` into `W_{Q,K,V}` and `ln_final.w` into `W_U`, which is a
+*different* operator `P_π` — a π optimized against one is not a fixed point of the other.
+Measured on `results/wide_optimizations/wide_results_20260920_203446.pt`, recomputing the
+loss of the stored `pi_final` gives:
+
+| rank | heads | stored `final_loss` | recomputed, `fold_ln=True` | recomputed, `fold_ln=False` |
+|---|---|---|---|---|
+| 0 | [3] | 4.76e-05 | 1.25e-02 (263×) | 1.00e-03 (21×) |
+| 1 | [4] | 9.00e-05 | 2.39e-01 (2658×) | 2.58e-03 (29×) |
+| 3 | [4] | 1.35e-04 | 3.13e-01 (2319×) | 3.95e-03 (29×) |
+| 5 | [6] | 2.31e-04 | 5.32e-02 (230×) | 3.48e-03 (15×) |
+
+Every post-hoc analysis cell that feeds the cell-15 `model` into a `wide_results` fixed
+point — the generation cells, `measure_branching_factor` (cell 104), the Jacobian cells
+(106–108) — has been reading the wrong operator. Use `load_semantic_analysis_model()`,
+which loads with `fold_ln=False, dtype=torch.float32` and freezes the parameters.
+`SemanticUnigramMSM.__init__` detects a folded model (`cfg.normalization_type != "LN"`)
+and prints a CRITICAL warning.
+
+**(b) The stored `pi_final` is top-4096 truncated.** `pi_to_sparse_cpu(pi, top_k=4096)`
+keeps 4096 entries and does not renormalize, but the optimizer's π is `softmax(pi_logits)`
+— dense over all 48262 tokens, floor ~1e-12. That tail is not cosmetic: it sits inside the
+attention normalizer `π·exp(QK)`, so deleting it changes `P_π` itself. On a freshly
+optimized dense π, truncating to top-4096 (losing 1.3 % of the mass) multiplies the loss by
+~10×; it is the residual 15–30× column in the table above. **A stored `pi_final` is
+therefore an approximation of the fixed point, not the fixed point.** Store `pi_logits`, or
+raise `store_top_k`, if you need it exactly. The class warns whenever the supplied π
+carries less than 99.9 % of its mass, and `run_fixed_point_analysis(reported_loss=...)`
+prints the recomputed/reported ratio and warns above 5×.
+
+A third, unrelated observation from the same file: re-running `optimize_pi_one_layer` from
+the stored `pi_init` with the identical config does **not** reproduce `final_loss` (1.35e-04
+→ 1.06e-03 for rank 3). The mathematics of cells 9 and 89 is unchanged since the run (only
+diagnostics were added), so this is float32/GPU nondeterminism compounding over 3500
+natural-gradient iterations on a very flat landscape. Treat individual endpoints as
+samples, not as reproducible objects.
+
+#### 2.16.3 What the class computes, in order
+
+```
+pi (frozen)  ──►  state set S  ──►  reduced matrix  ──►  spectrum / QSD  ──►  Doob
+                                                                             │
+                                          basins (PCCA+)  ◄──────────────────┘
+                                                │
+                                                └──►  macro chain  ──►  outer Jacobian
+```
+
+1. **The exact forward pass.** `_rows_batch` reproduces `compute_P_chunk` from
+   `pi_to_pi_P_one_layer_topk` verbatim — π-weighted attention
+   `A ∝ π·exp(q·kᵀ/√d_head)`, summed OV over the head group, `+ b_O`, `+ W_E[u]`,
+   `ln_final`, unembed, softmax, optional top-p with the same STE. The difference is that
+   it returns the **rows** of `P_π` rather than only the product `π P_π`. Verified against
+   the cell-9 function: `max|difference| = 1.5e-07` (float32 noise) on a 512-state set.
+   `push_forward(states, weights)` reproduces `pi_to_pi_P_one_layer_topk` exactly and is
+   what the Jacobian and the self-consistency check use.
+
+2. **State selection**, three ways:
+   - `states_from_top_k(k)` — the top-k tokens of π, i.e. the same query chunk the
+     optimizer used (`chunk_size`). The default, and the only one directly commensurable
+     with `final_loss`.
+   - `states_explicit(tokens)` — an arbitrary set of unigram keys.
+   - `explore(...)` — the unigram specialization of
+     `MetastableKGramEngine.run_pruned_power_iteration`. Because a state *is* a token, the
+     successor of `u → v` is just `v`, so all the suffix bookkeeping of the K-gram engine
+     collapses into a masked vector-matrix product on the vocabulary simplex. Same
+     three-part audit (internal / frontier / leakage rates), same halting rule
+     (`frontier_rate < frontier_threshold` and `leakage_rate < leakage_threshold` for
+     `min_stable_steps` consecutive steps), plus a `max_support` cap. Typical behaviour:
+     16 seeds → 976 states in 4 iterations, frontier 0.00 %, leakage 1.6 %.
+
+3. **`build_reduced_matrix`** extracts `S = P_π[states, states]` — dense while
+   `N ≤ dense_max_states` (4096), otherwise a pruned `scipy.sparse.csr_matrix` — and audits
+   the truncation: how much of π the set holds, the π-weighted one-step retention
+   `Σ_u π̂_u Σ_{v∈S} P[u,v]`, and the per-state leakage `1 − Σ_{v∈S} P[u,v]`. Warns below
+   99 % on either.
+
+4. **`analyze_chain`**:
+   - Largest strongly connected component (`scipy.sparse.csgraph`), the same Tarjan shear
+     as `MetastableMSMAnalyzer`, so Doob's transform is well defined.
+   - Dense left/right eigendecomposition of the **sub-stochastic** `S`. Its Perron root
+     `λ₁ < 1` is the per-token survival probability of the whole set; `escape_rate = 1 − λ₁`,
+     `lifetime = 1/(1 − λ₁)`, `half_life = ln2 / (−ln λ₁)`, all in tokens. The left Perron
+     vector, clipped and L1-normalized, is the **quasi-stationary distribution**.
+   - `JSD(π_restricted, QSD)` — the sharpest single test of whether π really is the
+     stationary object of its own chain.
+   - Doob `h`-transform `P_cond = (1/λ₁)·diag(r)⁻¹ S diag(r)`, row-rescrubbed to exact
+     stochasticity. Its spectrum is what "metastable" means.
+   - **Basin counting.** A basin boundary is a **real, positive** eigenvalue of `P_cond`
+     near 1 whose implied timescale `−1/ln|λ|` exceeds `min_basin_timescale` (default 5
+     tokens). Two other things also sit near the unit circle and are explicitly *not*
+     counted: a **complex pair** (rotation — a cycle through states, e.g.
+     `p → ru → cks → p`) and a **real negative** value near −1 (period-2 alternation).
+     Both are one basin with internal periodic structure; `has_cyclic_modes` flags them.
+     Spectral gaps tell you *how many*; PCCA+ tells you *which states*.
+   - PCCA+ on the reversibilized conditioned chain, following
+     `MetastableMSMAnalyzer.run_conditioned_pcca`: adjoint `P* = diag(π)⁻¹ P_cond diag(π)`,
+     Fill symmetrization `P_sym = (P_cond + P*)/2`, then `deeptime` `pcca`. Empty crisp
+     clusters (PCCA+ returns them when the requested `m` exceeds the number of genuine
+     metastable sets) are dropped and renumbered with a warning.
+   - Macro chain `T = (χᵀΠχ)⁻¹ χᵀΠ P_cond χ`. Per basin: QSD weight, π weight, stay
+     probability `T[b,b]`, **dwell time `1/(1 − T[b,b])` and half-life in tokens**, and the
+     QSD-weighted escape rate out of the whole state set.
+
+5. **`basin_jacobian`** — see §2.16.4.
+
+6. **`run_fixed_point_analysis`** chains all of the above and adds the loss-commensurable
+   numbers: `πP` mass, `JSD(π, πP)`, the same JSD with `πP` renormalized (so the truncation
+   deficit cannot flatter it), both `×1e5/d_vocab`, and the ratio against `reported_loss`.
+
+#### 2.16.4 The outer Jacobian on the inter-basin chain
+
+Everything in step 4 is the **inner** problem: π was held frozen, so nothing there can say
+whether π itself is stable. The **outer** problem is the self-consistent one,
+`π_{t+1} = Φ(π_t) := π_t P_{π_t}` — a self-interacting (mean-field) Markov chain. Stability
+means the Jacobian of `Φ` at `π*` has spectral radius < 1, and on the raw simplex that is a
+48262×48262 object, which is what makes `jacobian_stability_analysis` expensive and hard to
+read (§7.6 is the same complaint in the other lane).
+
+**The reduction.** If the chain has `m` metastable basins `B₁…B_m`, then after a few tokens
+the only thing about π that still matters is *how much mass sits in each basin*: inside a
+basin the shape relaxes fast to `μ_i`, the weights move slowly. So replace π by `m` numbers
+
+```
+w = (w₁ … w_m),  w ≥ 0,  Σ wᵢ = 1
+π(w) = w₁ μ₁ + … + w_m μ_m        (μᵢ = the QSD conditioned on basin i)
+```
+
+These weights are the **reaction coordinates** — the term is from chemical physics: the few
+slow collective variables along which a reaction actually proceeds, as opposed to the many
+fast vibrations. The reduced map pushes `π(w)` through one exact step and re-reads the
+weights, renormalized over the state set (the same "conditioned on not having escaped"
+convention as the QSD):
+
+```
+ν = π(w) P_{π(w)}                       (exact semantic forward pass)
+F_i(w) = ν(Bᵢ) / Σ_j ν(B_j)
+```
+
+`w` lives on a simplex, so the Jacobian is taken in the chart
+`u = (w₁ … w_{m−1})`, `w_m = 1 − Σu`, by **central finite differences** along
+`e_b − e_m` — `2(m−1) + 1` forward passes over the state set, no autodiff, no 48262×48262
+operator.
+
+**Reading it.** With `ρ = max|eig(J)|`:
+
+- `ρ < 1` — the mixture is a **stable attractor**. Tip mass from one basin to another and
+  the feedback pushes it back; a long generation really does visit the basins in these
+  proportions.
+- `ρ > 1` — the mixture is a **saddle**. It is a genuine fixed point, but balanced on a
+  ridge: the eigenvector with `|λ| > 1` names which combination runs away (positive entries
+  = the basin that wins, negative = the basin that empties), and a single generation
+  collapses into one basin, chosen by early noise.
+
+This is the mean-field picture from ferromagnets and Hopfield networks — pure states are
+attractors, symmetric mixtures sit on the ridge between them — and it is exactly the object
+§7 hunts with continuation and bisection, here obtained directly from the spectrum.
+`m = 1` returns `{"applicable": False}`: with one basin there is no mixture direction and
+the inner spectrum is the whole story.
+
+#### 2.16.5 Output structure
+
+`run_fixed_point_analysis` returns
+
+```python
+{
+  "config":  {heads, temperature, top_p, state_selection, top_k, n_states, pi_stored_mass},
+  "states":  LongTensor[N],
+  "explore": None | {states, measure, history, is_converged, iterations},
+  "reduced": {S, states, n_states, is_dense, leakage_per_state, row_mass,
+              pi_restricted, pi_mass_captured, pi_mass_truncated, retention_under_pi},
+  "analysis":{core_mask, core_states, core_size, S_core, P_cond, pi_core, qsd, r_perron,
+              lambda_1, escape_rate, set_lifetime_tokens, set_half_life_tokens,
+              evals_sub, moduli_sub, implied_timescales_sub, spectral_gaps_sub,
+              evals_cond, moduli_cond, implied_timescales_cond, jsd_pi_qsd,
+              n_basins_detected, n_basins_used, has_cyclic_modes,
+              memberships, crisp_clusters, pi_conditioned, T_macro,
+              basins: [{index, n_states, qsd_weight, pi_weight, p_stay, dwell_tokens,
+                        half_life_tokens, escape_to_outside_per_token, mu, state_mask,
+                        top_tokens, top_probs}]},
+  "jacobian":{applicable, J, eigenvalues, spectral_radius, is_stable, verdict,
+              w0, F_w0, self_consistency_residual, unstable_directions, basin_mu, step},
+  "self_consistency": {pi_P_mass, jsd_pi_piP, jsd_pi_piP_renormalized,
+                       loss_like_raw, loss_like_renormalized, reported_loss,
+                       loss_ratio_recomputed_over_reported, ln_folded},
+  "elapsed_s": float,
+}
+```
+
+`analyze_wide_fixed_points` additionally attaches `rank`, `heads`, `result` and `analyzer`.
+Cost: ~1–2 min per fixed point at `top_k=512` on one GPU, dominated by the `N/256`
+forward-pass batches for the reduced matrix and the `2(m−1)+1` extra passes for the
+Jacobian.
+
+#### 2.16.6 Reporting
+
+- `print_fixed_point_report(report, model, top_n=15)` — truncation audit, self-consistency
+  (including the reported-vs-recomputed ratio), container lifetime, conditioned spectrum
+  with implied timescales, per-basin dwell times with their top tokens, the macro chain,
+  the outer stability verdict, and a π-vs-QSD table with each state's row mass.
+- `plot_fixed_point_report(...)` — four panels: π vs QSD on the top states; `|λ|` of
+  `P_cond` annotated with implied timescales; the macro chain as a heat map titled with the
+  stability verdict; per-state leakage against π with the set escape rate marked.
+- `plot_induced_chain_graph(report, model, top_k=20, min_edge=5e-3)` — the chain itself as
+  a `networkx` digraph. Node size and shade = mass in π, node ring colour = PCCA+ basin,
+  edge width and opacity ∝ transition probability so near-zero edges fade out. Several
+  visually separated clumps joined by thin edges = several metastable basins.
+- `summarize_fixed_point_analyses(reports)` — one line per fixed point.
+
+#### 2.16.7 What it says about `wide_results_20260920_203446.pt`
+
+Ten best fixed points, `top_k=512`, `fold_ln=False`, `min_basin_timescale=5`:
+
+```
+rank heads  reported  recomp  ratio  piMass    lam1  life(tok)  JSD(pi,QSD)  bas  t2     rho   verdict
+   0   [3]  4.76e-05 1.00e-03  21.0  0.9955  0.99438    178.1     3.12e-05    1  12.97    -    single basin [cyclic]
+   1   [4]  9.00e-05 2.56e-03  28.5  0.9881  0.98350     60.6     1.45e-02    2  35.65  1.172  SADDLE
+   2   [3]  9.45e-05 2.78e-03  29.4  0.9849  0.98081     52.1     3.91e-07    1   1.22    -    single basin
+   3   [4]  1.35e-04 3.92e-03  29.0  0.9838  0.97811     45.7     6.51e-06    1   4.79    -    single basin
+   4   [3]  1.80e-04 1.36e-03   7.6  0.9878  0.98600     71.4     6.09e-05    1   0.76    -    single basin
+   5   [6]  2.31e-04 3.47e-03  15.0  0.9873  0.98298     58.8     7.37e-04    2  41.62  0.683  STABLE [cyclic]
+```
+
+Three things to take from it.
+
+1. **These are metastable containers, not stationary states.** Lifetimes are 45–180 tokens
+   against a 1024-token context window. A generation started from one of them leaves it
+   well before the context is full, so "the fixed point" is a transient the model passes
+   through, not a state it settles in.
+
+2. **`JSD(π, QSD)` separates the good ones from the suspect ones.** Ranks 2 and 3 have
+   `JSD ≈ 1e-6…1e-7`: π *is* the quasi-stationary distribution of its own chain, which is
+   the strongest statement available that the optimization found a real object. Rank 1 has
+   `JSD = 1.4e-02`, four orders of magnitude worse — and it is exactly the one the outer
+   Jacobian calls a saddle.
+
+3. **Rank 3 is a 3-cycle, not a basin structure.** `λ₂` of `P_cond` is a complex pair at
+   `|λ| = 0.8115` (timescale 4.8 tokens) and the transition rows read
+   `'p' → 'ru'` (0.998), `'ru' → 'cks'` (0.995), `'cks' → 'p'` (0.586) / `'ke'` (0.206).
+   One basin containing a fast rotation. Rank 1 is the genuine two-basin case: 15 states
+   with a 48-token dwell against 497 states with a 493-token dwell, `λ₂ = 0.972`
+   (35.7 tokens), and `ρ = 1.17` along `[+1, −1]` — the small basin grows, the large one
+   empties. That is a textbook mean-field saddle.
+
+---
+
 ## 3. Goals & Use Cases
 
 ### 3.1 Goal by component
@@ -1623,6 +1907,7 @@ spread π, so a `chunk_size` that was ample for one head may not be for eight.
 | Component | Goal |
 |---|---|
 | `pi_to_pi_P_one_layer*` | Compute the induced next-token measure for a **1-layer, position-free, token-level** abstraction of the model, over any subset of layer-0 heads. Cheapest possible instantiation of `P_π`. |
+| `SemanticUnigramMSM` (§2.16) | Analyse a fixed point of that operator: is the state set closed, how long does it live in tokens, is π its own quasi-stationary distribution, how many metastable basins does it hold and how long is the dwell in each, and is the mixture a stable attractor or a saddle. |
 | `run_wide_head_optimization` | Fan the token-level fixed-point search out over a corpus and over **head groups**, one group per GPU (§2.15). |
 | `abstract_forward_pass` | Compute `P(next token \| K-gram query, frozen π)` for a **multi-layer** model with positional and sink structure explicitly modeled. The workhorse. |
 | `compute_stationary_distribution` | Differentiably apply `P_π` `M` times to a sparse measure over K-grams while keeping the support at size `N`. |
@@ -1796,6 +2081,23 @@ silently changes the semantics. The exception runs the other way: `single_layer_
 applies γ but **never β**, so `ExactSemanticHeadForwardPass` (§2.10) requires the
 `fold_ln=True` model, where β has been folded into `b_{Q,K,V}`, and its constructor raises
 otherwise. The two lanes want different loads; reload the model when you switch.
+
+**⚠ `fold_ln` again — the wide SEMANTIC lane wants `fold_ln=False` too.**
+`_wide_optimization_worker` (cell 89) loads its own model with `fold_ln=False`, but cell 15
+loads the interactive `model` with the default `fold_ln=True`. Every cell that feeds the
+cell-15 `model` into a `wide_results` fixed point — the generation cells, the branching
+factor sweep (cell 104), the Jacobian cells (106–108) — is therefore evaluating a
+**different operator** from the one that produced the fixed point. Measured on the
+2026-09-20 results, the recomputed loss is 230–2700× the stored `final_loss` with
+`fold_ln=True` and 8–30× with `fold_ln=False`. Use `load_semantic_analysis_model()`
+(cell 110); `SemanticUnigramMSM` detects a folded model and prints a CRITICAL warning.
+See §2.16.2.
+
+**⚠ A stored `pi_final` is not the π the loss was measured at.** `pi_to_sparse_cpu` keeps
+the top 4096 entries without renormalizing, while the optimizer's π is a dense `softmax`.
+The deleted tail lives inside the attention normalizer `π·exp(QK)`, so it changes `P_π`
+itself — worth ~10× on the loss. Store `pi_logits` or raise `store_top_k` if you need the
+fixed point exactly. See §2.16.2.
 
 **⚠ `L_ctx_list` / `C_far_list` must be sliced to the ACTIVE heads.**
 `profile_thermodynamic_heads` returns one entry per head in the model;
