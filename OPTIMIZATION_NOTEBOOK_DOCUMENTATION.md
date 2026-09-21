@@ -61,7 +61,7 @@ attention logits as a function of relative distance `d`. These statistics feed t
 [71–78]  K-gram exploration → sub-stochastic matrix → MSM spectral + PCCA+ analysis
 [79–82]  Sweep the MSM pipeline along a generated trajectory; QSD affinity matrix
 [83–87]  Trajectory diagnostics: JSD loss at positional vs. non-positional fixed points
-[88–106] Wide semantic head optimization — one head per GPU over a real corpus,
+[88–106] Wide semantic head optimization — one head GROUP per GPU over a real corpus,
          + result inspection, branching factors, Jacobian stability
 [107–111] APPROXIMATION QUALITY BENCHMARK — how close is the abstraction to the real model?
   ├─ [108] DEFINITIONS (85 KB): estimators, approximate passes, the benchmark harness,
@@ -309,6 +309,13 @@ landscape is **discontinuous whenever the top-k membership changes**, and the gr
 w.r.t. tokens outside the top-k is exactly zero. The notebook mitigates this by tracking
 both `losses` (biased) and `full_losses` (exact) on the same plot — if the two curves
 diverge, the top-k truncation is the culprit.
+
+**The `heads` argument is a subset, and it is summed.** All three variants index
+`W_{Q,K,V,O}[layer, heads]` and sum the head outputs before adding `b_O`, so `heads=[0,3]`
+is the *two-head* operator in one forward pass, not two operators. Any subset is allowed,
+up to the whole layer. With `W_pos` out of the picture the result is **exact** at every
+subset size — see §2.15.2 for the measured agreement against the real model, and §2.15 for
+the corpus-wide driver that fans this out over head groups.
 
 `pi_to_pi_P_one_layer_topk` also deliberately **disables gradient checkpointing**
 (the `checkpoint(...)` call is commented out) because with only `chunk_size` queries the
@@ -1359,23 +1366,24 @@ Two further details specific to this lane:
 ---
 ### 2.14 Wide multi-timescale mean-field optimization (cells 136–140)
 
-The wide fixed-point search of §"Wide Semantic Head Optimization" (cells 88–106), re-run on
-the **full** MTMF operator instead of the 1-head token-level one. One independent
+The wide fixed-point search of §2.15 (cells 88–106), re-run on the **full** MTMF operator
+instead of the token-level semantic one. One independent
 explore-then-optimize run per `(text, position)` pair, single GPU — there is nothing to fan
-out over heads, because every head is in play at once.
+out over heads, because every head is in play at once. (Cells 88–106 *can* now put every
+head in one group, but that is still the position-free operator; see §2.15.2.)
 
 #### 2.14.1 What changes relative to cells 89/91
 
 | | Cells 89/91 (token-level) | Cells 136–140 (MTMF) |
 |---|---|---|
-| Operator | `pi_to_pi_P_one_layer_topk`, one head, no positions | `MultiTimescaleMeanFieldForwardPass`, all heads, positions on |
+| Operator | `pi_to_pi_P_one_layer_topk`, any head subset, no positions | `MultiTimescaleMeanFieldForwardPass`, all heads, positions on |
 | State | unigram, dense `[vocab]` | **K-gram**, sparse `[N, K]` + `[N]` |
 | Mean field | the state itself | the state's **unigram marginal** via `kgram_to_unigram` |
 | Initial condition | `pi_from_context` — the raw context histogram | `DiscountedUnigramContextEstimator`, lifted to K-grams |
 | Exploration | none | no-grad power iteration of the same operator |
 | Pruning inside `πP` | per-query top-k | **post-aggregation** over the `(K−1)`-suffix table (§2.5.1) |
-| Parallelism | one head per GPU, `joblib`/`loky` | single process, single GPU |
-| Result key | `wide_results[head][i]` | `wide_mtmf_results[i]` (flat list) |
+| Parallelism | one head **group** per GPU, `joblib`/`loky` | single process, single GPU |
+| Result key | `wide_results[tuple(heads)][i]` | `wide_mtmf_results[i]` (flat list) |
 
 Two of those deserve spelling out.
 
@@ -1498,13 +1506,124 @@ optimization in flight. §6 says which panel diagnoses which knob.
 
 ---
 
+### 2.15 Wide semantic head-group optimization (cells 88–94)
+
+The corpus-wide fixed-point search for the **token-level, position-free** operator. One
+independent natural-gradient run per `(head group, text, position)` triple, fanned out
+across GPUs with `joblib`/`loky`.
+
+#### 2.15.1 What a "head group" is
+
+`heads` was originally a single head index per GPU. It is now a **group** — any subset of
+layer-0 heads that are all active *simultaneously in the same forward pass*, exactly as the
+real model sums its heads before the unembedding. `[0, 3]` is therefore the two-head
+semantic operator, **not** two separate single-head runs.
+
+`run_wide_head_optimization(head_groups=...)` accepts either form:
+
+```python
+head_groups = [0, 3, 4, 6]              # legacy: four single-head experiments
+head_groups = [[0, 3], [4, 6]]          # two two-head experiments
+head_groups = [[0], [3], [0, 3], [0, 3, 4, 6]]   # a nesting ladder
+head_groups = [list(range(model.cfg.n_heads))]   # the whole layer, positions still off
+```
+
+`normalize_head_groups` canonicalizes all of these to a sorted tuple per group and raises on
+a repeated head inside a group (it would be double-counted in the OV sum) or a duplicate
+group (the results dict is keyed by group). Head order inside a group is irrelevant — the
+head outputs are summed — which is why the key is sorted.
+
+**The result dict is keyed by the group tuple**, not by an int:
+
+```python
+wide_results[(0, 3)][i]["heads"]   # (0, 3)
+wide_results[(3,)][i]["final_loss"]
+```
+
+Each result dict carries `heads` (the tuple) and, for older readers, a `head` alias that is
+the bare int for a singleton group and the tuple otherwise. Cell 93's loader falls back to
+`result.get("heads", (result["head"],))` so `.pt` files written before this change still
+load.
+
+#### 2.15.2 It is still purely semantic at every group size
+
+Group size changes nothing about the abstraction. `pi_to_pi_P_one_layer_topk` never reads
+`model.W_pos` — the π-weighted `exp(QK)` normalizer *is* the softmax over positions, for
+any number of heads — so `[0,3,4,6]` is the exact position-free four-head operator, not an
+approximation of it. Verified against the real model with `W_pos` zeroed and the
+complementary heads ablated at `blocks.0.attn.hook_result`:
+
+```
+heads [3]                 max|ΔP| = 2.5e-07    TV = 1.1e-06
+heads [0, 3]              max|ΔP| = 3.9e-07    TV = 1.6e-06
+heads [0, 3, 4, 6]        max|ΔP| = 2.5e-06    TV = 2.8e-06
+heads [0..7] (all)        max|ΔP| = 1.6e-06    TV = 2.9e-06
+```
+
+i.e. float32 round-off throughout. So `head_groups=[list(range(8))]` gives you the fixed
+points of the **entire layer with positions off** — which is the honest semantic-only
+counterpart of the MTMF lane (§2.14), and the right thing to diff against it when you want
+to know what the positional structure is actually buying.
+
+Two caveats that do *not* go away with grouping: the run models `heads + b_O` only, so the
+real side of any comparison must ablate the complementary heads; and `attn_scale` is
+hardcoded to `sqrt(d_head)` inside the forward pass (§2.1).
+
+#### 2.15.3 `share_positions`
+
+`share_positions=True` gives **every** head group the same sampled cut points, which is the
+only way a loss comparison across groups is meaningful — otherwise each group is answering
+a different question about a different set of contexts. It is the right default when you
+are running a nesting ladder like `[[0], [3], [0, 3], [0, 3, 4, 6]]`.
+
+`False` (the historical behavior) derives a per-group seed from the group tuple via
+`head_group_seed`, so each group samples its own positions. Use it when the groups are
+independent experiments and you want broader corpus coverage rather than comparability.
+
+#### 2.15.4 The `min_pi_P_mass` guard
+
+`pi_to_pi_P_one_layer_topk` does **not** renormalize its output: `πP` sums to
+`π[top_tokens].sum()`, so mass that π puts outside the top-`chunk_size` query set silently
+vanishes, and the JSD is then taken between a probability vector and a sub-probability
+measure. **The deficit flatters the loss.** Measured on a 1024-token Wikipedia-like context
+(π support ≈ 450), head 3:
+
+```
+chunk=  64   πP mass = 0.534   loss = 8.60e-01   (full-vocab truth: 1.05e+00)   −18%
+chunk= 512   πP mass = 1.000   loss = 1.0526     (full-vocab truth: 1.0526)     exact
+chunk=4096   πP mass = 1.000   exact
+```
+
+`optimize_pi_one_layer` now tracks the smallest `πP` mass over the run, returns it as a
+fifth value, stores it in each result as `min_pi_P_mass`, prints a per-run warning below
+`mass_warning_threshold` (default `0.999`) and reports the worst value per group in the
+summary. **If that warning fires, the reported losses for that run are optimistic and are
+not comparable to a run where it did not fire.** Raise `chunk_size` above the effective
+support of π rather than trusting a fixed number — and note that wider head groups tend to
+spread π, so a `chunk_size` that was ample for one head may not be for eight.
+
+#### 2.15.5 Signature changes to be aware of
+
+- `run_wide_head_optimization`: `heads_to_run` → **`head_groups`**; new `share_positions`
+  and `mass_warning_threshold`; returns `{tuple(heads): [...]}`.
+- `_wide_optimization_worker`: `head: int` → **`heads: tuple`**; validates against
+  `model.cfg.n_heads`.
+- `optimize_pi_one_layer`: returns **five** values now —
+  `(pi_best, best_loss, n_performed, losses, min_pi_P_mass)`. Any other caller of this
+  function must be updated to unpack the fifth.
+- Cells 91–94 were updated in step; cell 92 saves `head_groups` and `share_positions` into
+  `wide_run_config`, and cell 94 is indexed by a tuple (`heads = (0, 3)`).
+
+---
+
 ## 3. Goals & Use Cases
 
 ### 3.1 Goal by component
 
 | Component | Goal |
 |---|---|
-| `pi_to_pi_P_one_layer*` | Compute the induced next-token measure for a **1-layer, position-free, token-level** abstraction of the model. Cheapest possible instantiation of `P_π`. |
+| `pi_to_pi_P_one_layer*` | Compute the induced next-token measure for a **1-layer, position-free, token-level** abstraction of the model, over any subset of layer-0 heads. Cheapest possible instantiation of `P_π`. |
+| `run_wide_head_optimization` | Fan the token-level fixed-point search out over a corpus and over **head groups**, one group per GPU (§2.15). |
 | `abstract_forward_pass` | Compute `P(next token \| K-gram query, frozen π)` for a **multi-layer** model with positional and sink structure explicitly modeled. The workhorse. |
 | `compute_stationary_distribution` | Differentiably apply `P_π` `M` times to a sparse measure over K-grams while keeping the support at size `N`. |
 | `MetastableKGramEngine` | Find the (approximately) closed set of K-grams the model recirculates through under a fixed context — i.e. *the attractor's support*. |
@@ -1528,6 +1647,18 @@ optimization in flight. §6 says which panel diagnoses which knob.
 GD) if 52 is numerically unstable; cell 57 (damped Picard) if you want to know which fixed
 point the dynamics actually *fall into*. Use `pi_to_pi_P_one_layer_topk` in the loop and
 `pi_to_pi_P_one_layer` for periodic validation.
+
+**"...and I want many of them, over a corpus, for several head subsets."**
+→ Cells 88–94 (§2.15). Pass `head_groups=[[0], [3], [0, 3], [0, 3, 4, 6]]` with
+`share_positions=True` to run a nesting ladder on identical initial conditions, one group
+per GPU. Read `min_pi_P_mass` in the summary before comparing losses across groups.
+
+**"How much of the fixed-point structure is positional rather than semantic?"**
+→ Run cells 88–94 with `head_groups=[list(range(model.cfg.n_heads))]` — the exact
+position-free *whole-layer* operator — and diff against the MTMF lane of cells 136–140,
+which is the same layer with positions on (§2.14). Both are corpus-wide searches over the
+same kind of initial condition, so the difference is attributable to the positional
+apparatus rather than to the search.
 
 **"I want to find a fixed point of a multi-layer model over K-grams."**
 → Cell 68 (current, 3-part partition). Do **not** start from cell 60.
