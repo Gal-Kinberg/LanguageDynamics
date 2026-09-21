@@ -46,7 +46,8 @@ attention logits as a function of relative distance `d`. These statistics feed t
 ```
 [0–3]    Environment: nvidia-smi, pip/mamba installs, sys.path hack, global imports
 [4–13]   DEFINITIONS ONLY — no side effects except function/class binding
-  ├─ [5]   General helpers (PCA plotting, attention-pattern plotting)
+  ├─ [5]   General helpers (PCA plotting, attention-pattern plotting,
+  │        `long_context_window` — §2.17)
   ├─ [7]   Activation patching / knockout hooks + similarity metrics
   ├─ [9]   "Optimization and Black Box Functions" — the 1-LAYER, TOKEN-LEVEL machinery
   ├─ [10]  THE BIG CELL (86 KB) — head profiling + the MULTI-LAYER, K-GRAM machinery
@@ -1602,13 +1603,161 @@ chunk= 512   πP mass = 1.000   loss = 1.0526     (full-vocab truth: 1.0526)    
 chunk=4096   πP mass = 1.000   exact
 ```
 
-`optimize_pi_one_layer` now tracks the smallest `πP` mass over the run, returns it as a
+`optimize_pi_one_layer` tracks the smallest `πP` mass over the run, returns it as a
 fifth value, stores it in each result as `min_pi_P_mass`, prints a per-run warning below
 `mass_warning_threshold` (default `0.999`) and reports the worst value per group in the
-summary. **If that warning fires, the reported losses for that run are optimistic and are
-not comparable to a run where it did not fire.** Raise `chunk_size` above the effective
-support of π rather than trusting a fixed number — and note that wider head groups tend to
-spread π, so a `chunk_size` that was ample for one head may not be for eight.
+summary. **If that warning fires, the reported top-k losses for that run are optimistic and
+are not comparable to a run where it did not fire.**
+
+Those numbers above were measured at the *initial condition*, where π is the empirical
+unigram measure of a ≈1000-token context and therefore has support ≤ 1000. They do not
+survive optimization, and §2.15.4a is the correction.
+
+#### 2.15.4a How wide does `chunk_size` actually have to be? (measured)
+
+The empirical unigram π you start from is compact; **the π you converge to is not.** Three
+3500-iteration runs on `attn-only-1l`, head 3, from the same initial condition, differing
+only in `chunk_size` (2026-09-21):
+
+| `chunk_size` | reported top-k loss | full-vocab loss | reported / full | `πP` mass | ms/iter | peak VRAM |
+|---|---|---|---|---|---|---|
+| 512  | 1.549e-03 | 2.142e-03 | 0.72 | 0.936 |  23 | 0.97 GiB |
+| 1024 | 1.042e-03 | 1.403e-03 | 0.74 | 0.954 |  41 | 1.62 GiB |
+| 4096 | 6.709e-04 | 7.796e-04 | 0.86 | 0.984 | 151 | 5.52 GiB |
+
+Two separate facts are in that table.
+
+1. **The top-k loss is systematically optimistic**, by 1.2–1.4× at the widths actually in
+   use. The bias shrinks as the chunk widens but is still 16 % at 4096.
+2. **A wider chunk does not merely measure the same point more honestly — it lands on a
+   genuinely better fixed point.** The true loss falls 2.1e-03 → 7.8e-04 going from 512 to
+   4096. Chunk width is an accuracy knob on the *search*, not only on the *report*.
+
+The mass profile of the converged π is nearly identical in all three runs, so it is a
+property of the fixed point rather than of the optimizer:
+
+```
+top    256: 0.900      top   4096: 0.984
+top    512: 0.926      top   8192: 0.994
+top   1024: 0.949      top  16384: 0.9985
+top   2048: 0.969      top  32768: 0.9999
+```
+
+So **`chunk_size = 1024` is not "wide enough"** in the 99.9 %-mass sense — it carries about
+95 %. Reaching 99.9 % takes `chunk_size ≈ 16384`, i.e. a third of the vocabulary. That tail
+is real: at a fixed point π *is* a next-token distribution of the model, and a 1-layer
+attention-only model's next-token distribution has a fat tail. It is not a softmax floor
+(the floor contributes ~5e-06 in total).
+
+The same measurement on the previous production run
+(`wide_results_20260920_203446.pt`, `chunk_size=512`, 400 optimizations) agrees: the median
+stored π carried 0.81–0.93 of its mass in its top 512 and **not one of the 400 runs** reached
+0.999 anywhere inside the stored top 4096.
+
+**What to do about it.** Do not chase 99.9 % inside the optimizer; buy most of the accuracy
+and then measure exactly.
+
+- Optimize at `chunk_size = 4096` with `micro_chunk = 1024` (§2.15.4b).
+- Set `full_vocab_eval=True`. After the loop, `full_vocab_loss` recomputes
+  `JSD(π, πP)` with `πP` summed over **all** `d_vocab` queries, under `no_grad`, in 0.85 s
+  for one head and 2.0 s for four. It is stored per result as `final_loss_full_vocab`,
+  alongside `loss_inflation = final_loss_full_vocab / final_loss`. **Report the full-vocab
+  number.** It is unbiased, and it is the only loss that is comparable across runs with
+  different `chunk_size`.
+- `pi_mass_profile` and `k_for_target_mass` are stored per result, so the question "was my
+  chunk wide enough" is answered by the data rather than by a guess. The summary line at
+  the end of `run_wide_head_optimization` prints the share of runs that cleared the target.
+
+#### 2.15.4b `pi_to_pi_P_topk_chunked` — decoupling accuracy from VRAM
+
+`pi P = Σ_u π_u P[u,:]` over `u ∈ top_tokens` is a plain sum, so it can be accumulated over
+micro-batches of queries. `pi_to_pi_P_topk_chunked` splits `top_tokens` into blocks of
+`micro_chunk` and wraps each block in `torch.utils.checkpoint`, so peak activation memory is
+set by `micro_chunk` and **not** by `chunk_size`:
+
+```
+attn-only-1l, Quadro RTX 5000 (16 GiB)
+heads      chunk   micro_chunk    ms/iter   peak VRAM
+[3]         4096   None (off)         151     5.52 GiB
+[3]         4096   1024               244     1.62 GiB
+[3]        16384   2048               900     2.93 GiB
+[0,3,4,6]   4096   1024               582     5.36 GiB
+[0,3,4,6]   4096   None (off)          —      OOM
+```
+
+It is a thin wrapper over cell 9's `pi_to_pi_P_one_layer_topk`, deliberately: there stays
+exactly **one** definition of the forward pass in the notebook. The price is that `k`/`v`
+(weight-only constants) are re-derived per micro-batch, ~20 % overhead. Verified against a
+single unchunked call at `chunk_size=4096`, head 3: `max|ΔπP| = 1.5e-07` and
+`max|Δgrad| = 1.2e-07` — float32 summation order only. `micro_chunk=None` restores the old
+behavior exactly.
+
+Convergence budget: at `chunk_size=4096` the loss plateaus by iteration ~1200, so
+`max_iterations=2000` is enough and `3500` buys nothing.
+
+#### 2.15.4c Is one power iteration enough? (λ₂ = −0.84, measured)
+
+A recurring worry: `JSD(π, πP_π)` uses a **single** application of the operator. Is that a
+good enough stand-in for "π is the stationary distribution"?
+
+**Yes — one step is not an approximation of stationarity, it is the definition of it.**
+`π = πP_π` says exactly that π is a left eigenvector of its own induced operator with
+eigenvalue 1, i.e. π is the stationary distribution of the chain it induces. There is
+nothing to converge.
+
+**Iterating *undamped* is strictly worse.** `πP^n = π` is implied by `πP = π` but does not
+imply it: any measure invariant under an `n`-cycle satisfies it. Using `JSD(π, πP^n)` as the
+loss therefore *enlarges* the zero set with spurious period-`n` solutions. Do not do it.
+
+**Iterating *damped* is safe but changes nothing about what you find.** For
+`M = αI + (1−α)P` with `α ∈ (0,1)`, the eigenvalues are `μ = α + (1−α)λ`, which fill the
+disk of radius `1−α` centered at `α` — a disk that touches the unit circle only at `μ = 1`.
+So `|μ| = 1 ⟹ μ = 1 ⟹ λ = 1`, and `πMⁿ = π ⟺ πP = π` exactly. The damped multi-step
+residual has the **same zero set** as the single step. What it changes is conditioning: its
+linearization carries `1 − μⁿ`, which for a slow mode (`λ → 1`) is `≈ n(1−α)(1−λ)` — an
+`n(1−α)`-fold amplification of exactly the flat directions — while saturating fast modes
+near 1. It is a preconditioner on the residual, not a different question.
+
+**What the chain actually looks like here.** Measured on the converged head-3 π from the
+`chunk_size=4096` run, deflating the `λ = 1` direction and iterating `d ← dP` with `P`
+frozen:
+
+```
+step  1: |dP|/|d| = 0.019   cos(dP,d) = +0.001
+step  4: |dP|/|d| = 0.837   cos(dP,d) = −0.998
+step 10: |dP|/|d| = 0.843   cos(dP,d) = −1.000     <- converged
+```
+
+`λ₂ = −0.843`, real and negative. **The suspicion about periodicity is correct in
+substance**: the slowest mode of the induced chain is an almost-period-2 oscillation. The
+consequences are visible directly:
+
+```
+n      JSD(π, πPⁿ)      L1|πPⁿ − π|        JSD(π, πMⁿ), α=0.5     L1
+1        7.797e-04        3.497e-02            2.054e-04        1.749e-02
+2        7.778e-04        3.167e-02            4.371e-04        2.370e-02
+3        8.940e-04        3.657e-02            5.979e-04        2.703e-02
+5        8.853e-04        3.532e-02            7.591e-04        3.010e-02
+10       8.372e-04        3.107e-02            8.416e-04        3.166e-02
+```
+
+The undamped iteration **oscillates and never settles** — `πPⁿ` is not an estimate of
+anything. The damped iteration converges monotonically (`λ₂(M) = 0.5 + 0.5(−0.843) = 0.079`,
+a huge contraction) to the frozen chain's true stationary measure μ, at `‖μ − π‖₁ = 0.0317`.
+
+And the punchline for the loss: the **single-step residual (7.80e-04) already matches the
+converged damped one (8.42e-04) to within 8 %**. The single step is not hiding a slow drift;
+it is measuring the same distance-to-stationarity that ten damped steps measure, for
+one tenth of the cost.
+
+**Recommendation.** Keep the single-step loss as the objective. The spectral gap here is
+`1 − 0.843 = 0.157` (mixing time ~6 tokens), so there are no near-unit modes for a
+multi-step residual to amplify and the preconditioning would buy little for an `n`× cost.
+If you do want to try it, use damping (`α ≈ 0.5`) and a small `n`, never undamped, and A/B
+it at a fixed wall-clock budget rather than a fixed iteration count. What *is* worth doing
+unconditionally is **recording `λ₂` per fixed point** — a 15-step deflated power iteration
+costs ~1 s and the sign of `λ₂` is a first-class property of the attractor.
+`SemanticUnigramMSM` (§2.16) already computes the spectrum on its reduced state set.
 
 #### 2.15.5 Signature changes to be aware of
 
@@ -1616,11 +1765,22 @@ spread π, so a `chunk_size` that was ample for one head may not be for eight.
   and `mass_warning_threshold`; returns `{tuple(heads): [...]}`.
 - `_wide_optimization_worker`: `head: int` → **`heads: tuple`**; validates against
   `model.cfg.n_heads`.
-- `optimize_pi_one_layer`: returns **five** values now —
-  `(pi_best, best_loss, n_performed, losses, min_pi_P_mass)`. Any other caller of this
-  function must be updated to unpack the fifth.
-- Cells 91–94 were updated in step; cell 92 saves `head_groups` and `share_positions` into
-  `wide_run_config`, and cell 94 is indexed by a tuple (`heads = (0, 3)`).
+- `optimize_pi_one_layer`: returns **six** values now —
+  `(pi_best, best_loss, n_performed, losses, min_pi_P_mass, diagnostics)`. Any other caller
+  of this function must be updated to unpack the sixth. New arguments: `micro_chunk`,
+  `use_checkpoint`, `full_vocab_eval`, `full_vocab_micro_chunk`, `mass_target`.
+- `_wide_optimization_worker` / `run_wide_head_optimization`: new `fold_ln` (**default
+  `True`**), `micro_chunk`, `use_checkpoint`, `full_vocab_eval`, `full_vocab_micro_chunk`,
+  `store_mass_trace`; **`store_top_k` now defaults to `None`**, which stores the dense π.
+- `pi_to_sparse_cpu` → **`pi_to_storage_cpu`** (the old name is kept as an alias).
+  `top_k=None` returns a dense float32 CPU tensor.
+- New result keys: `final_loss_full_vocab`, `loss_inflation`, `pi_P_mass_at_best`,
+  `pi_mass_profile`, `k_for_target_mass`, `chunk_size`, `micro_chunk`, `fold_ln`,
+  `store_top_k`.
+- Cells 91–94 were updated in step; cell 92 saves `head_groups`, `share_positions`,
+  `fold_ln`, `store_top_k`, `micro_chunk` and `full_vocab_eval` into `wide_run_config`;
+  cell 93 ranks by `final_loss_full_vocab` and reads a dense **or** sparse `pi_final`; and
+  cell 94 is indexed by a tuple (`heads = (0, 3)`).
 
 ---
 
@@ -1653,8 +1813,9 @@ class so that there is exactly one definition of `P_π` in this lane.
 
 #### 2.16.2 ⚠ Two traps this class exists to catch
 
-**(a) `fold_ln`.** Cell 15 loads the interactive `model` with the TransformerLens default
-`fold_ln=True`. `_wide_optimization_worker` (cell 89) loads with **`fold_ln=False`**.
+**(a) `fold_ln`. — FIXED 2026-09-21; this describes the pre-fix state.** Cell 15 loads the
+interactive `model` with the TransformerLens default `fold_ln=True`, while
+`_wide_optimization_worker` (cell 89) used to load with **`fold_ln=False`**.
 Folding LayerNorm moves `ln1.w` into `W_{Q,K,V}` and `ln_final.w` into `W_U`, which is a
 *different* operator `P_π` — a π optimized against one is not a fixed point of the other.
 Measured on `results/wide_optimizations/wide_results_20260920_203446.pt`, recomputing the
@@ -1667,23 +1828,42 @@ loss of the stored `pi_final` gives:
 | 3 | [4] | 1.35e-04 | 3.13e-01 (2319×) | 3.95e-03 (29×) |
 | 5 | [6] | 2.31e-04 | 5.32e-02 (230×) | 3.48e-03 (15×) |
 
-Every post-hoc analysis cell that feeds the cell-15 `model` into a `wide_results` fixed
-point — the generation cells, `measure_branching_factor` (cell 104), the Jacobian cells
-(106–108) — has been reading the wrong operator. Use `load_semantic_analysis_model()`,
-which loads with `fold_ln=False, dtype=torch.float32` and freezes the parameters.
-`SemanticUnigramMSM.__init__` detects a folded model (`cfg.normalization_type != "LN"`)
-and prints a CRITICAL warning.
+**The fix went the other way round.** Rather than unfold the analysis cells, the whole
+semantic lane was standardized on the TransformerLens default `fold_ln=True`:
+`_wide_optimization_worker` and `run_wide_head_optimization` now take an explicit
+`fold_ln: bool = True` and pass it to `from_pretrained`, cell 15 says `fold_ln=True`
+explicitly, and `load_semantic_analysis_model()` (cell 110) defaults to `fold_ln=True`.
+Every result dict records the `fold_ln` it was produced under, so the check is mechanical.
+The K-gram lane (§4.2) is the one that still needs `fold_ln=False`; reload the model when
+you switch lanes.
 
-**(b) The stored `pi_final` is top-4096 truncated.** `pi_to_sparse_cpu(pi, top_k=4096)`
+⚠ The warning strings inside cell 110 still read as if the workers were unfolded and fire a
+CRITICAL on `fold_ln=True`. They are stale and now say the opposite of the truth. Results
+saved **before** 2026-09-21 were produced with `fold_ln=False` and must still be analyzed
+with an unfolded model; they carry no `fold_ln` key, which is how you tell them apart.
+
+**(b) The stored `pi_final` is top-4096 truncated. — FIXED 2026-09-21 (`store_top_k=None`
+now stores the dense π); this describes the pre-fix state and still applies to older
+`.pt` files.** `pi_to_sparse_cpu(pi, top_k=4096)`
 keeps 4096 entries and does not renormalize, but the optimizer's π is `softmax(pi_logits)`
 — dense over all 48262 tokens, floor ~1e-12. That tail is not cosmetic: it sits inside the
 attention normalizer `π·exp(QK)`, so deleting it changes `P_π` itself. On a freshly
 optimized dense π, truncating to top-4096 (losing 1.3 % of the mass) multiplies the loss by
 ~10×; it is the residual 15–30× column in the table above. **A stored `pi_final` is
-therefore an approximation of the fixed point, not the fixed point.** Store `pi_logits`, or
-raise `store_top_k`, if you need it exactly. The class warns whenever the supplied π
-carries less than 99.9 % of its mass, and `run_fixed_point_analysis(reported_loss=...)`
-prints the recomputed/reported ratio and warns above 5×.
+therefore an approximation of the fixed point, not the fixed point.**
+
+The fix: `pi_to_storage_cpu(pi, top_k=None)` stores a dense float32 CPU copy of exactly the
+`softmax(pi_logits)` the optimizer held. At `d_vocab = 48262` that is 193 KB per vector,
+~390 KB per result for `pi_init` + `pi_final`, ~140 MB for a 90-text × 4-group run — which
+is cheaper than the 221 MB the top-4096 sparse form cost on 2026-09-17, because a sparse COO
+tensor stores an int64 index alongside every float. There is no reason not to use it, and
+`store_top_k=None` is now the default in `_wide_optimization_worker`. Storing `pi_logits`
+is unnecessary once π itself is exact.
+
+The class still warns whenever the supplied π carries less than 99.9 % of its mass, and
+`run_fixed_point_analysis(reported_loss=...)` prints the recomputed/reported ratio and warns
+above 5×. On a dense π the first warning no longer fires; the second can still fire because
+of the top-k **query** truncation, which is a different effect (§2.15.4a).
 
 A third, unrelated observation from the same file: re-running `optimize_pi_one_layer` from
 the stored `pi_init` with the identical config does **not** reproduce `final_loss` (1.35e-04
@@ -1857,10 +2037,15 @@ Jacobian.
 - `plot_fixed_point_report(...)` — four panels: π vs QSD on the top states; `|λ|` of
   `P_cond` annotated with implied timescales; the macro chain as a heat map titled with the
   stability verdict; per-state leakage against π with the set escape rate marked.
-- `plot_induced_chain_graph(report, model, top_k=20, min_edge=5e-3)` — the chain itself as
-  a `networkx` digraph. Node size and shade = mass in π, node ring colour = PCCA+ basin,
-  edge width and opacity ∝ transition probability so near-zero edges fade out. Several
-  visually separated clumps joined by thin edges = several metastable basins.
+- `plot_induced_chain_graph(report, model, top_k=20, min_edge=5e-3, show_self_edges=True)` —
+  the chain itself as a `networkx` digraph. Node size and shade = mass in π, node ring
+  colour = PCCA+ basin, edge width and opacity ∝ transition probability so near-zero edges
+  fade out. Several visually separated clumps joined by thin edges = several metastable
+  basins. Self-transitions `S[i,i] ≥ min_edge` (states that lead back to themselves — the
+  repetition loops) are drawn as crimson self-loops, width-scaled among *themselves* so a
+  near-absorbing state does not wash out the off-diagonal edges, and the self probability is
+  printed under the node's token label as `↻0.93`. Pass `show_self_edges=False` for the old
+  off-diagonal-only picture.
 - `summarize_fixed_point_analyses(reports)` — one line per fixed point.
 
 #### 2.16.7 What it says about `wide_results_20260920_203446.pt`
@@ -1897,6 +2082,73 @@ Three things to take from it.
    with a 48-token dwell against 497 states with a 493-token dwell, `λ₂ = 0.972`
    (35.7 tokens), and `ρ = 1.17` along `[+1, −1]` — the small basin grows, the large one
    empties. That is a textbook mean-field saddle.
+
+### 2.17 `long_context_window` — generating past `n_ctx` in the semantic regime (cell 5)
+
+A context manager in the general-helpers cell that temporarily lets a position-free model
+run on sequences far longer than `model.cfg.n_ctx`.
+
+```python
+with long_context_window(model, n_long_context=10_000):
+    out = model.generate(" Matra" * 200, max_new_tokens=5000, temperature=1.0)
+```
+
+**The argument.** Every semantic experiment in the notebook runs with
+`("hook_pos_embed", remove_pos_embed_hook)`, i.e. with the positional contribution to the
+residual stream forced to zero. In that regime the model is *exactly* position-free, and
+`model.cfg.n_ctx` stops being a property of the function the model computes — it is only
+(a) the number of rows stored in `W_pos` and (b) the side length of the pre-registered
+causal mask. Both are storage limits. Replacing `W_pos` with a **zero table of shape
+`[n_long_context, d_model]`** removes both without changing a single output at any position
+the original table already covered: a zero row contributes the same zero vector the hook
+was producing anyway. Verified empirically — inside the manager, an unhooked forward pass
+on a 1024-token prompt matches the hooked reference to `max|Δlogits| = 0.0` on
+`attn-only-1l`.
+
+**What it mutates, all restored in a `finally` (so exceptions are safe):**
+
+| Mutated | To | Why |
+|---|---|---|
+| `model.pos_embed.W_pos.data` | zeros `[n_long_context, d_model]` | the actual trick |
+| `model.cfg.n_ctx` | `n_long_context` | otherwise `model.to_tokens()` truncates at the old length, and notebook code that reads `model.cfg.n_ctx` (cells 17, 40, 68, 72, 96, 116, …) still sees 1024 |
+| `blk.attn.mask` for every block | `[n_long_context, n_long_context]` causal mask | only if `extend_masks=True` (the default) |
+
+**Signature.**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `model` | — | a `HookedTransformer` |
+| `n_long_context` | `10_000` | positions to pretend the model has |
+| `extend_masks` | `True` | pre-build the causal masks up front instead of letting TransformerLens grow them lazily |
+| `verbose` | `False` | print the swap and the restore |
+
+Yields the same `model` object, mutated in place.
+
+**Notes and limits.**
+
+- **It refuses non-standard positional embeddings.** `cfg.positional_embedding_type` must
+  be `"standard"`. Rotary (Llama, Pythia in some configs) and ALiBi inject position inside
+  attention, where blanking `W_pos` cannot reach — the manager raises `ValueError` rather
+  than silently producing a model that is still positional. This is the same constraint
+  §4.2 documents for the K-gram pipeline.
+- **Inside the manager you no longer need `remove_pos_embed_hook`.** `W_pos` *is* zero, so
+  the hook is a no-op. Leaving it in is harmless.
+- **It is meaningless with positional embeddings on.** If you are studying positional
+  structure, this manager just deletes what you are studying.
+- **Memory.** The causal mask is `bool`, so `n_long_context²` bytes **per layer**: ~100 MB
+  at `N = 10_000`, ~2.5 GB at `N = 50_000`. Attention itself is `O(N²)` too — a
+  10k-token pass on 1-layer/8-head `attn-only-1l` already materializes ~800M attention
+  scores. Size `N` to the longest sequence you actually need, not to a round number.
+  `extend_masks=False` also works on this TransformerLens version (it extends `attn.mask`
+  lazily inside `apply_causal_mask`), but the lazy path mutates the buffer in place and so
+  leaves the oversized mask behind after the manager exits; building it up front is what
+  makes the restore complete.
+- **Passing `n_long_context < model.cfg.n_ctx`** is allowed but prints a warning — it
+  shrinks the usable window.
+- The model is genuinely being run out of distribution: it never saw 10k-token sequences
+  in training, and the semantic-only regime is itself off-distribution (§4.5 item 2). This
+  is a tool for probing the position-free dynamical system, not for claiming the model
+  "supports" a 10k context.
 
 ---
 
@@ -2064,6 +2316,13 @@ Needed by the DLA cells (24–28) and the `hook_result` knockout in cell 22, but
 multiplies attention activation memory by `n_heads`. Turn it off before any large
 profiling run.
 
+**⚠ `long_context_window` mutates the model in place.** It swaps `model.pos_embed.W_pos`,
+`model.cfg.n_ctx` and every `blk.attn.mask`, and restores them in a `finally`. It is
+therefore safe against exceptions but **not** against a Jupyter kernel interrupt that kills
+the cell mid-`with`, nor against code that captures `model.cfg.n_ctx` into a global inside
+the block and uses it outside. If a run leaves `model.cfg.n_ctx` at 10000, re-run cell 15.
+See §2.17.
+
 **⚠ Model/pipeline mismatch.** Cell 15 loads `meta-llama/Llama-3.2-1B-Instruct`, but
 `single_layer_forward` and `abstract_forward_pass` read `model.W_pos`. TransformerLens
 **does not create a `pos_embed` module at all** when `cfg.positional_embedding_type ==
@@ -2082,22 +2341,29 @@ applies γ but **never β**, so `ExactSemanticHeadForwardPass` (§2.10) requires
 `fold_ln=True` model, where β has been folded into `b_{Q,K,V}`, and its constructor raises
 otherwise. The two lanes want different loads; reload the model when you switch.
 
-**⚠ `fold_ln` again — the wide SEMANTIC lane wants `fold_ln=False` too.**
-`_wide_optimization_worker` (cell 89) loads its own model with `fold_ln=False`, but cell 15
-loads the interactive `model` with the default `fold_ln=True`. Every cell that feeds the
-cell-15 `model` into a `wide_results` fixed point — the generation cells, the branching
-factor sweep (cell 104), the Jacobian cells (106–108) — is therefore evaluating a
-**different operator** from the one that produced the fixed point. Measured on the
-2026-09-20 results, the recomputed loss is 230–2700× the stored `final_loss` with
-`fold_ln=True` and 8–30× with `fold_ln=False`. Use `load_semantic_analysis_model()`
-(cell 110); `SemanticUnigramMSM` detects a folded model and prints a CRITICAL warning.
+**⚠ `fold_ln` again — the wide SEMANTIC lane is now standardized on `fold_ln=True`.**
+As of 2026-09-21 `_wide_optimization_worker` (cell 89) takes an explicit `fold_ln=True`,
+matching cell 15 and `load_semantic_analysis_model()`. Before that it loaded with
+`fold_ln=False` while cell 15 loaded folded, so every cell that fed the cell-15 `model`
+into a `wide_results` fixed point — the generation cells, the branching factor sweep
+(cell 104), the Jacobian cells (106–108) — was evaluating a **different operator** from the
+one that produced the fixed point. Measured on the 2026-09-20 results, the recomputed loss
+was 230–2700× the stored `final_loss` with `fold_ln=True` and 8–30× with `fold_ln=False`.
+**Results saved before 2026-09-21 carry no `fold_ln` key and must be analyzed unfolded.**
 See §2.16.2.
 
-**⚠ A stored `pi_final` is not the π the loss was measured at.** `pi_to_sparse_cpu` keeps
-the top 4096 entries without renormalizing, while the optimizer's π is a dense `softmax`.
-The deleted tail lives inside the attention normalizer `π·exp(QK)`, so it changes `P_π`
-itself — worth ~10× on the loss. Store `pi_logits` or raise `store_top_k` if you need the
-fixed point exactly. See §2.16.2.
+**⚠ A stored `pi_final` was not the π the loss was measured at — fixed 2026-09-21.**
+`pi_to_sparse_cpu` kept the top 4096 entries without renormalizing, while the optimizer's π
+is a dense `softmax`. The deleted tail lives inside the attention normalizer `π·exp(QK)`, so
+it changes `P_π` itself — worth ~10× on the loss. `store_top_k=None` (the new default)
+stores the dense π, at 193 KB per vector. Older `.pt` files are still truncated; their
+results carry `store_top_k` absent or set to an integer. See §2.16.2.
+
+**⚠ The top-k QUERY truncation is a second, independent bias, and it does not go away with
+a dense π.** `πP` is only summed over the top-`chunk_size` queries, so it carries
+`π[top_chunk].sum()` of the mass. At convergence that is ~0.95 at `chunk_size=1024` and
+~0.984 at 4096, and the reported loss is 0.72–0.86× the true one. Set `full_vocab_eval=True`
+and report `final_loss_full_vocab`. See §2.15.4a.
 
 **⚠ `L_ctx_list` / `C_far_list` must be sliced to the ACTIVE heads.**
 `profile_thermodynamic_heads` returns one entry per head in the model;
