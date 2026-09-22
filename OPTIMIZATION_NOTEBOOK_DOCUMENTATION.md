@@ -63,7 +63,7 @@ attention logits as a function of relative distance `d`. These statistics feed t
 [79–82]  Sweep the MSM pipeline along a generated trajectory; QSD affinity matrix
 [83–87]  Trajectory diagnostics: JSD loss at positional vs. non-positional fixed points
 [88–106] Wide semantic head optimization — one head GROUP per GPU over a real corpus,
-         + result inspection, branching factors, Jacobian stability
+         + result inspection, branching factors (§2.18), Jacobian stability
 [107–111] APPROXIMATION QUALITY BENCHMARK — how close is the abstraction to the real model?
   ├─ [108] DEFINITIONS (85 KB): estimators, approximate passes, the benchmark harness,
   │        `DiscountedUnigramContextEstimator` and `MultiTimescaleMeanFieldForwardPass`
@@ -2237,6 +2237,161 @@ Yields the same `model` object, mutated in place.
   in training, and the semantic-only regime is itself off-distribution (§4.5 item 2). This
   is a tool for probing the position-free dynamical system, not for claiming the model
   "supports" a 10k context.
+
+---
+
+### 2.18 Branching factor and attractor clustering (cells 9, 102, 104, 106, 108)
+
+`measure_branching_factor` (cell 9) restarts the model `N_generations` times from
+statistically identical contexts drawn from one `π`, re-estimates the macroscopic state of
+each continuation, builds the pairwise JSD matrix and clusters it with
+`DBSCAN(metric="precomputed", eps=jsd_threshold)`. The number of clusters is the branching
+factor. Cells 102 (single fixed point) and 104 (the sweep over `wide_results`, which
+attaches `branching_results_final` to every result) are its two call sites; cell 106 turns
+the stored dicts into figures and cell 108 re-clusters them.
+
+#### 2.18.0 What goes into the JSDs — `N_estimate` and `initial_reference`
+
+Two settings decide *what is being compared* before any clustering happens.
+
+**`N_estimate` (default `1500`) — the estimation window.** The final state of a
+trajectory is estimated from the **last `N_estimate` of the `N_generate` generated
+tokens**, not from all of them. The first `N_generate − N_estimate` tokens are the
+transient the rollout spent falling into its basin; counting them mixes the path into the
+endpoint and makes two rollouts that ended in the same place look different because they
+took different routes there. Both the pairwise `jsd_matrix` and `jsd_to_initial` are built
+from these tail-estimated states. The value is clamped to `N_generate`
+(`N_estimate=1500` with `N_generate=500` just uses all 500), and `None` restores the old
+"use everything" behaviour. The returned dict carries `estimate_tokens`
+`[N_generations, N_estimate]` alongside the full `generated_tokens`, plus the effective
+`N_estimate`.
+
+Sizing it is a bias/variance trade: too large and the transient is back in the histogram;
+too small and the histogram itself is noisy, so rollouts inside one basin scatter and the
+branching factor inflates. A unigram state over a ~48k vocabulary needs on the order of
+10³ tokens before the JSD between two draws from the *same* distribution falls well below
+`jsd_threshold` — 1500 out of 4000 is the working setting in cell 104. If you raise
+`jsd_threshold` to compensate for a small window you are trading one artifact for another;
+raise `N_generate` instead.
+
+**`initial_reference` (default `"pi"`) — what "how far did it move?" means.**
+`jsd_to_initial[i]` used to be `JSD(empirical state of trajectory i's own `N_context`
+prompt tokens, final state of trajectory i)`. That reference is a *finite-sample
+realization* of π: it carries `O(1/√N_context)` sampling noise, and it is a **different
+point for every trajectory**, so the "distance travelled" numbers were not measured from a
+common origin and `below_threshold` could fire on prompt noise rather than on motion.
+
+The default is now `"pi"`: the reference is **π itself**, the state whose fixed-point
+property is under test, shared by every trajectory. `sparse_state_from_pi` (cell 9, new)
+puts the dense π into the estimator's own `(vals [N_c], keys [N_c, S_init])` format,
+reusing the estimator's `exclude_special` / `min_mass` / `top_n` / `fill_token_id` through
+its `_sparsify` and `_resolve_fill_token_id`, so both sides of the JSD are filtered
+identically. It is only meaningful for a **unigram** state — a dense token-level π cannot
+be lifted to genuine K-gram keys — so with a `KGramContextEstimator` the helper raises, the
+call prints a warning and falls back to `"context"`. Pass `initial_reference="context"`
+explicitly to get the old per-prompt behaviour back.
+
+Consequences: `jsd_to_initial` is now a *bona fide* distance from one common point, which
+is what cell 108 assumes when it adds the initial state to the clustering as an extra node
+(its caveat about "each rollout started from its own realization" no longer applies to new
+runs). Expect the values to shift relative to older runs — the prompt realization sits a
+sampling-noise distance away from π, so old numbers were biased upward by an amount that
+grows as `N_context` shrinks. `initial_distributions` (the per-prompt states) is still
+computed and returned as a diagnostic, and the new keys `reference_distribution` (π in
+sparse form, or `None`) and `initial_reference` (the mode actually used, after any
+fallback) record which convention a stored run was measured under; runs predating this
+change carry neither key and were all `"context"`.
+
+
+#### 2.18.0b The initial state is one of the points — `cluster_initial`
+
+With `cluster_initial=True` (the default) the state the rollouts were launched from is
+appended to the DBSCAN input as **one extra node, last**, its row and column taken from
+`jsd_to_initial` — the same augmentation, and the same indexing convention, as
+`cluster_rollouts_dbscan` in cell 108. This is only a well-posed thing to do because
+`initial_reference="pi"` (§2.18.0) makes every entry of `jsd_to_initial` a distance to the
+*same* state; under the old per-prompt reference the extra row was a different point in
+every column.
+
+What it buys is the question the branching factor cannot answer on its own: **did anything
+come back?** `initial_label` is the initial state's cluster and `n_rollouts_with_initial`
+counts the rollouts that share it.
+
+- `initial_in_cluster` is `True` iff **at least one rollout** shares the initial state's
+  cluster. It is deliberately *not* `initial_label >= 0`: at `min_samples == 1` DBSCAN
+  never labels anything noise, so an isolated initial state comes back as a singleton
+  cluster of its own, and reading that as "clustered" would invert the flag's meaning.
+  `initial_is_noise` keeps the raw DBSCAN verdict (`label == -1`) for when you want it.
+- The initial node **takes part** in the clustering rather than merely being labelled by
+  it. It can bridge two rollout groups into one cluster (verified: two groups 1.0 apart at
+  `eps=0.6` cluster separately, but an initial state 0.5 from both chains them into one),
+  and at `min_samples > 1` it can supply the neighbour that lets a sparse group survive.
+  Set `cluster_initial=False` to cluster the rollouts alone, which is what runs before
+  this change did.
+- It is **never a branch**. `branching_factor`, `cluster_sizes` and `n_noise` are over
+  rollouts only, so `cluster_sizes.sum() + n_noise == N_generations` still holds. Because
+  the initial node can be the sole holder of a label, `cluster_sizes` is no longer indexed
+  by label: it is aligned with the new **`cluster_label_ids`**, and `augmented_labels`
+  `[N_generations + 1]` carries the raw DBSCAN output with the initial state last.
+
+Read against `n_below_threshold`, which asks the same question per trajectory and without
+any clustering (`JSD(reference, final_i) < jsd_threshold`), the two disagree in an
+informative way: `n_below_threshold` counts rollouts inside a ball around π, while
+`n_rollouts_with_initial` counts rollouts DBSCAN can reach from π by chaining through
+other rollouts, so it also picks up a basin that is elongated rather than round.
+
+#### 2.18.1 What `min_samples` changes
+
+DBSCAN's `min_samples` used to be hardcoded to `1`; it is now an argument of
+`measure_branching_factor`, **defaulting to `1`**, so every existing call and every stored
+result keeps exactly the number it had.
+
+| `min_samples` | What a cluster means | Noise |
+|---|---|---|
+| `1` (default) | An **endpoint**: a lone rollout is its own branch. | Impossible — DBSCAN labels nothing `-1`. |
+| `>= 2`, in practice `>= 3` | An **attractor**: a place that many rollouts independently agreed on. | Sparser rollouts get label `-1`, are dropped from `cluster_sizes` and counted in `n_noise`. |
+
+The distinction matters because at `min_samples=1` the branching factor saturates at
+`N_generations` the moment the rollouts are noisy — it then measures "how spread out are
+the endpoints", not "how many basins are there". This is the same argument cell 108's
+`cluster_rollouts_dbscan` makes, and the two are now the same knob under two names.
+
+Consequences inside the function when `min_samples > 1`:
+
+- `cluster_labels` can contain `-1`. The branching factor counts distinct **non-negative**
+  labels only, and `cluster_sizes = np.bincount(labels[labels >= 0])`, so it sums to
+  `N_generations - n_noise` rather than to `N_generations`.
+- Two new result keys: **`n_noise`** (int) and **`min_samples`** (int, what it ran under).
+  Both are absent from `.pt` files written before this change; everything in that era ran
+  at `min_samples=1`, so read them with `br.get("n_noise", 0)` and `br.get("min_samples", 1)`,
+  which is what cell 106 does.
+- `below_threshold` / `n_below_threshold` are **unaffected**. They are a per-trajectory
+  displacement test (`JSD(reference, final_i) < jsd_threshold`, §2.18.0), not a
+  clustering, so the "stayed in its own basin" count means the same thing at every
+  `min_samples`.
+- In cell 106, `bf_effective` (the entropy-based effective branch count) and
+  `top_cluster_frac` are computed over the clustered rollouts only; the `n_noise` dropped
+  ones are excluded from both, and `n_generations` falls back to
+  `cluster_sizes.sum() + n_noise` when `jsd_to_initial` is missing.
+
+#### 2.18.2 Which knob to reach for
+
+Cell 104 exposes the setting as a `BRANCHING_MIN_SAMPLES` constant next to the estimator,
+wired into the `measure_branching_factor` call.
+
+**Prefer leaving it at `1` and re-clustering with cell 108.** `cluster_rollouts_dbscan`
+reads the stored `jsd_matrix` / `jsd_to_initial` and re-runs DBSCAN at any
+`(jsd_threshold, min_samples)` you like with **no generation and no forward pass**, so
+sweeping the parameter costs nothing; it additionally puts the initial state on the map as
+one extra node and reports `n_attractors` / `is_saddle_candidate`, which the in-line
+clustering does not. Raise `min_samples` inside `measure_branching_factor` only when you
+want the attractor count to *be* the stored `branching_factor` — e.g. a long unattended
+sweep whose rollouts you do not intend to keep, or a figure pipeline you would rather not
+teach about `attractor_clustering`.
+
+One caveat for either route: `min_samples >= 3` with a small `N_generations` will label
+almost everything noise. Cell 104 runs 20 generations, which is enough for `min_samples=3`;
+cell 102's 10 is marginal.
 
 ---
 
