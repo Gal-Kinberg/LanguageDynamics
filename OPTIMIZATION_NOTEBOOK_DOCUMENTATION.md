@@ -91,7 +91,7 @@ attention logits as a function of relative distance `d`. These statistics feed t
 
 Cell numbering above is as of the revision this guide was written against (141 cells) and
 is now **stale**: the notebook currently has 166 cells. In particular §2.15's "cells 88–94"
-are cells 88–98, and the four `SemanticUnigramMSM` cells (§2.16) were inserted at 109–112,
+are cells 88–98, and the `SemanticUnigramMSM` cells (§2.16) were inserted at 109–113,
 shifting everything after them by +4. Cells 88–106 (the token-level wide optimization) are
 only sketched here; the approximation-quality benchmark is documented in full in §2.9 and
 §5, the exact 1-layer forward pass in §2.10, the full abstraction in §2.11–§2.13, and the
@@ -1819,14 +1819,15 @@ It replaces the ad-hoc combination of `jacobian_stability_analysis` (cell 9),
 `measure_branching_factor` for this lane. It is **unigram-only and semantic-only** by
 design: one layer, any head group, no positional embeddings, exact forward pass.
 
-#### 2.16.1 The four new cells
+#### 2.16.1 The five new cells
 
 | Cell | Contents |
 |---|---|
 | 109 | Markdown header for the section |
 | 110 | `SemanticUnigramMSM`, `print_fixed_point_report`, `plot_fixed_point_report`, `plot_induced_chain_graph`, `load_semantic_analysis_model`, `analyze_wide_fixed_points`, `summarize_fixed_point_analyses` |
-| 111 | Runs the full pipeline over `wide_results` and prints the one-line-per-fixed-point summary |
+| 111 | Runs the full pipeline over `wide_results` and prints the one-line-per-fixed-point summary; carries a `cluster=` switch and a commented-out `cluster=False` fast sweep |
 | 112 | Per-fixed-point textual report + the four-panel diagnostic + the induced-chain graph |
+| 113 | Attaches every report to its optimization result as `fixed_point_analysis` and saves `wide_results` under a new `wide_results_with_fixed_point_analysis_*.pt` |
 
 Cell 110 depends only on cell 3's imports plus `networkx` (imported lazily inside the
 plotting function) and `deeptime` (already required by `MetastableMSMAnalyzer`). It does
@@ -1950,7 +1951,8 @@ pi (frozen)  ──►  state set S  ──►  reduced matrix  ──►  spect
      counted: a **complex pair** (rotation — a cycle through states, e.g.
      `p → ru → cks → p`) and a **real negative** value near −1 (period-2 alternation).
      Both are one basin with internal periodic structure; `has_cyclic_modes` flags them.
-     Spectral gaps tell you *how many*; PCCA+ tells you *which states*.
+     Spectral gaps tell you *how many*; PCCA+ tells you *which states*. The count is
+     cheap and is what `cluster=False` stops after (§2.16.3a).
    - PCCA+ on the reversibilized conditioned chain, following
      `MetastableMSMAnalyzer.run_conditioned_pcca`: adjoint `P* = diag(π)⁻¹ P_cond diag(π)`,
      Fill symmetrization `P_sym = (P_cond + P*)/2`, then `deeptime` `pcca`. Empty crisp
@@ -1965,6 +1967,38 @@ pi (frozen)  ──►  state set S  ──►  reduced matrix  ──►  spect
 6. **`run_fixed_point_analysis`** chains all of the above and adds the loss-commensurable
    numbers: `πP` mass, `JSD(π, πP)`, the same JSD with `πP` renormalized (so the truncation
    deficit cannot flatter it), both `×1e5/d_vocab`, and the ratio against `reported_loss`.
+
+#### 2.16.3a `cluster=False` — the spectral half only
+
+PCCA+ over a few thousand states, and the macro chain and outer Jacobian that follow it,
+are the expensive part of the pipeline: on a `top_k=2048` state set they dominate the
+minute-or-two per fixed point, while the eigendecomposition that *counts* the basins is
+seconds. `cluster=False` — on `analyze_chain`, `run_fixed_point_analysis` and
+`analyze_wide_fixed_points`, default `True` — stops at that boundary.
+
+| Still computed | Skipped |
+|---|---|
+| SCC core, sub-stochastic spectrum, λ₁, escape rate, lifetime, half-life | PCCA+ (`memberships`, `crisp_clusters`, `pi_conditioned`) |
+| QSD and `JSD(π, QSD)` | the macro chain `T_macro` |
+| Doob `P_cond`, its spectrum and implied timescales | the per-basin list: dwell times, half-lives, QSD/π weights, top tokens |
+| `n_basins_detected`, `has_cyclic_modes` | the outer Jacobian (step 5 / §2.16.4) |
+| the whole `self_consistency` block | |
+
+The skipped entries come back as `None` (`n_basins_used`, `memberships`,
+`crisp_clusters`, `pi_conditioned`, `T_macro`, `basins`) and the analysis dict carries
+`clustered: False`; `report["jacobian"]` is `{"applicable": False, "reason": ...}`, and
+`basin_jacobian` refuses an unclustered analysis rather than indexing into `None`.
+`config["cluster"]` records the choice.
+
+All three reporting helpers handle the mode: `print_fixed_point_report` prints the
+detected count and the π-vs-QSD table without the basin column, `plot_fixed_point_report`
+replaces the macro-chain panel with a note, `plot_induced_chain_graph` rings every node in
+neutral grey, and `summarize_fixed_point_analyses` prints the spectral count in `bas` with
+verdict `not clustered` (`rho` is `nan`).
+
+Use it when the question is *how many* basins each fixed point holds — a sweep over many
+results, or a scan over `min_basin_timescale` — and re-run the interesting ones with
+`cluster=True` for the assignment and the stability verdict.
 
 #### 2.16.4 The outer Jacobian on the inter-basin chain
 
@@ -2022,7 +2056,8 @@ the inner spectrum is the whole story.
 
 ```python
 {
-  "config":  {heads, temperature, top_p, state_selection, top_k, n_states, pi_stored_mass},
+  "config":  {heads, temperature, top_p, state_selection, top_k, n_states, pi_stored_mass,
+              cluster},
   "states":  LongTensor[N],
   "explore": None | {states, measure, history, is_converged, iterations},
   "reduced": {S, states, n_states, is_dense, leakage_per_state, row_mass,
@@ -2031,8 +2066,9 @@ the inner spectrum is the whole story.
               lambda_1, escape_rate, set_lifetime_tokens, set_half_life_tokens,
               evals_sub, moduli_sub, implied_timescales_sub, spectral_gaps_sub,
               evals_cond, moduli_cond, implied_timescales_cond, jsd_pi_qsd,
-              n_basins_detected, n_basins_used, has_cyclic_modes,
-              memberships, crisp_clusters, pi_conditioned, T_macro,
+              n_basins_detected, has_cyclic_modes, clustered,
+              # the rest are None when cluster=False:
+              n_basins_used, memberships, crisp_clusters, pi_conditioned, T_macro,
               basins: [{index, n_states, qsd_weight, pi_weight, p_stay, dwell_tokens,
                         half_life_tokens, escape_to_outside_per_token, mu, state_mask,
                         top_tokens, top_probs}]},
@@ -2048,7 +2084,8 @@ the inner spectrum is the whole story.
 `analyze_wide_fixed_points` additionally attaches `rank`, `heads`, `result` and `analyzer`.
 Cost: ~1–2 min per fixed point at `top_k=512` on one GPU, dominated by the `N/256`
 forward-pass batches for the reduced matrix and the `2(m−1)+1` extra passes for the
-Jacobian.
+Jacobian. `cluster=False` drops the PCCA+ and the Jacobian passes (§2.16.3a); the reduced
+matrix itself is unavoidable either way.
 
 #### 2.16.6 Reporting
 
@@ -2069,6 +2106,35 @@ Jacobian.
   printed under the node's token label as `↻0.93`. Pass `show_self_edges=False` for the old
   off-diagonal-only picture.
 - `summarize_fixed_point_analyses(reports)` — one line per fixed point.
+
+#### 2.16.6a Persisting the reports (cell 113)
+
+`analyze_wide_fixed_points` keeps the original result dict on every report
+(`report["result"]`), so cell 113 matches reports back to optimization runs **by object
+identity** rather than by re-deriving the pairing from heads/position/loss — which would
+be ambiguous the moment the same head group was optimized at several positions. A report
+whose `result` is not a member of the current `wide_results` (the usual cause:
+`wide_results` was reloaded from cell 93 after the analysis ran) is reported as orphaned
+and skipped, not silently mis-assigned.
+
+Each match gets a storable copy under `result["fixed_point_analysis"]`. Two keys are
+dropped: `analyzer` (a live `SemanticUnigramMSM` holding the GPU model) and `result`
+itself (it would be a reference cycle back into the object being saved). With the default
+`keep_matrices=False` the dense `core_size²` float64 matrices — `reduced["S"]`,
+`analysis["S_core"]`, `analysis["P_cond"]` (~34 MB each at 2048 states) — and
+`jacobian["basin_mu"]` are dropped as well; they are cheap to recompute from π. Everything
+surviving is moved to CPU by the same `_to_cpu` walker cell 105 uses, for the same reason:
+a file full of CUDA tensors only reloads on a machine with the same device.
+
+The container is then written to a **new**
+`wide_results_with_fixed_point_analysis_<timestamp>.pt` — never over the optimization
+`.pt` from cell 92/93 — alongside the original `config`, the `source_path` it came from,
+and a `fixed_point_analysis_config` recording the state selection, `top_k`, temperature,
+`top_p`, `cluster` and `ln_folded` the reports were produced under. Load it exactly like
+cell 93.
+
+All four degrade gracefully on a `cluster=False` report (§2.16.3a): no basin column, no
+macro-chain panel, grey node rings, verdict `not clustered`.
 
 #### 2.16.7 What it says about `wide_results_20260920_203446.pt`
 
