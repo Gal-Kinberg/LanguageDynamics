@@ -267,6 +267,8 @@ MultiTimescaleMeanFieldForwardPass(model, L_ctx, ...)      [cell 108]   ← ONE 
 │           │     ├── log_W_far = log E_pos(K) + log far_mass
 │           │     └── far_positional_value: + discount-weighted mean W_pos in the VALUE
 │           ├── 4. Z = ΣM_local + ΣM_far + M_sink, max-shifted
+│           │     (each of the three terms is droppable — `ablate_local`,
+│           │      `ablate_far_field`, `ablate_sink`; all three at once is refused)
 │           └── 5. residual → MLP (if any) → ln_final → W_U → softmax/T → top-p (STE)
 │
 ├── FIXED-POINT API  (cell 137)
@@ -1133,6 +1135,7 @@ the optimization through `W_far_h` alone. This is why §2.14's wide optimization
 | `layernorm_mode` | `"pairwise"` | `"frozen"` = one scalar σ for the far field (§2.11.3). |
 | `frozen_sigma` | RMS of a typical embedding | The scalar for `layernorm_mode="frozen"`. |
 | `mask_dead_local` | `True` | Wipe BOS/PAD positions out of the fast window so the sink is not double-counted. |
+| `ablate_local` | `False` | Drop the **fast-window block** entirely — no window mass in `Z`, no window value in the output — leaving the mean field and the sink to renormalize over themselves. The mirror image of `ablate_far_field`: that one prices the approximated term, this one prices the exact recent-token term. Note it removes the query's attention to **itself**, since `d = 0` is a window position; the query token still sets `q_full` and still enters the residual stream, so what is priced is the window as a *context* block. Verified equal, to 0.0 max abs difference, to masking every window token out of `M_local` via the dead-token mask. |
 | `ablate_sink` | `False` | Drop the BOS sink entirely — no key mass in `Z`, no value in the output. The JSD gap to `full` is how much of the forward pass the sink carries. |
 | `ablate_far_field` | `False` | Drop the **mean-field block** entirely — no far-field mass in `Z`, no far-field value in the output — leaving the exact window and the exact sink to renormalize over themselves. This is the row that prices **the approximation itself** (§2.13.1). Exactly equivalent to driving `far_mass → 0`, and verified as such to 0.0 max abs difference. With it on, `π`, `γ` and `far_mass` are inert: `forward` no longer needs a `far_mass` even at `gamma == 1.0`, and there is no gradient w.r.t. `context_vals`. |
 | `query_chunk_size` | `None` | Split the query batch when forming the `[H, N_q, N_c]` score tensor. `None` = one shot. |
@@ -1151,7 +1154,9 @@ JSD = 1.3e-12 nats on attn-only-1l, K-invariant across K = 1, 2, 8
 
 That is float32 round-off, and it is the evidence that the three blocks **partition the
 context exactly once**: window + far field + sink, no token counted twice and none
-dropped. K-invariance is the sharp part of the test — it says mass moved between
+dropped. Each block can also be switched off on its own (`ablate_local`,
+`ablate_far_field`, `ablate_sink`), with `Z` formed over whatever survives; switching all
+three off raises, since `Z` would be empty. K-invariance is the sharp part of the test — it says mass moved between
 `M_local` and `M_far` without changing the answer.
 
 ⚠ **No cell in the notebook currently reproduces this.** The number lives in the class's
@@ -1312,6 +1317,7 @@ contribution:
 | `no far pos. value` | `far_positional_value=False` | the mean positional embedding in the far-field value |
 | `no BOS sink` | `ablate_sink=True` | how much of the forward pass the sink carries |
 | `no far field (window+sink only)` | `ablate_far_field=True` | **the approximation itself** — see below |
+| `no local window (far+sink only)` | `ablate_local=True` | **the exact recent tokens** — the mirror of the row above |
 | `true query position` | `use_real_query_position=True` | the cost of the dummy `t*` |
 | `uniform L_ctx` | `L_ctx=L_ctx_used.mean()` | **whether per-head timescales matter at all** |
 | `K=1` / `K=8` / `K=16` | `K=…` | where the window/mean-field split should sit |
@@ -1331,6 +1337,22 @@ comes free with every run and is drawn as the line every bar must clear.
 > is most of the attention mass for a long-horizon head. It is drawn in its own warm hue
 > for that reason. If it lands near `full`, the mean field is decoration on this model and
 > the honest abstraction is a plain `K`-token window.
+
+> **`no local window` and `no far field` are a pair, and are read together.** They ablate
+> the two context-bearing terms of the partition function against each other: the exact
+> recent tokens and the approximated older ones. If `no local window` sits near `full`,
+> the window is decoration at this `K` and the head is a bag-of-context reader; if
+> `no far field` sits near `full`, the mean field is decoration and the honest abstraction
+> is a plain `K`-token window; if both are expensive, the two blocks are each carrying
+> their share, which is the regime the abstraction is built for. The two rows also move in
+> opposite directions with `K`, so reading them against the `K = …` rows is how the
+> window/mean-field split gets chosen. Both are drawn in their own warm hues.
+>
+> Note that `no local window` also deletes the query's attention to **itself** (`d = 0` is
+> a window position), so it is a heavier intervention than "drop the recent context": the
+> head is left resolving everything through the discounted bag of older tokens and the
+> sink. What survives is still exactly normalized — `Z` is formed over whichever blocks
+> are alive — so the row is a real forward pass, not a broken one.
 
 > **Read the `uniform L_ctx` row first.** If it matches `full`, the multi-timescale story
 > is not carrying its weight on this model and the whole per-head apparatus is decoration.
